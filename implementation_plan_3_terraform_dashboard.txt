@@ -1,0 +1,193 @@
+**✅ Here is your complete updated implementation package** with exactly what you asked for.
+
+### 1. Updated Terraform (Full `main.tf` – Production-Ready with Auto-Zip)
+
+This version:
+- Automatically zips your function code (new `main.py` + `requirements.txt` with Vision API)
+- Creates a dedicated code bucket
+- Uses the new function name and entry point
+- Includes all previous resources + the upgraded trigger
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "google" {
+  project = "YOUR_PROJECT_ID"   # ← change this
+  region  = "us-central1"
+}
+
+# 1. Code bucket for function source
+resource "google_storage_bucket" "function_code" {
+  name                        = "YOUR_PROJECT_ID-function-code"
+  location                    = "US"
+  uniform_bucket_level_access = true
+  force_destroy               = true
+}
+
+# 2. Auto-zip the function folder
+data "archive_file" "function_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/function_code"   # ← folder you will create (see below)
+  output_path = "${path.module}/function.zip"
+}
+
+# 3. Upload zip to code bucket
+resource "google_storage_bucket_object" "function_source" {
+  name   = "photo-fraud-trigger-${data.archive_file.function_zip.output_sha}.zip"
+  bucket = google_storage_bucket.function_code.name
+  source = data.archive_file.function_zip.output_path
+}
+
+# 4. Photos bucket
+resource "google_storage_bucket" "photos" {
+  name                        = "YOUR_PHOTOS_BUCKET"
+  location                    = "US"
+  uniform_bucket_level_access = true
+  force_destroy               = true
+}
+
+# 5. BigQuery dataset
+resource "google_bigquery_dataset" "fraud_detection" {
+  dataset_id = "fraud_detection"
+  location   = "US"
+}
+
+# 6. Upgraded Cloud Function (now with automatic reverse image lookup)
+resource "google_cloudfunctions2_function" "photo_fraud_trigger" {
+  name        = "photo-fraud-trigger"
+  location    = "us-central1"
+  description = "EXIF + Google Reverse Image Lookup + BigQuery insert"
+
+  build_config {
+    runtime     = "python312"
+    entry_point = "extract_exif_and_reverse_image"
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_code.name
+        object = google_storage_bucket_object.function_source.name
+      }
+    }
+  }
+
+  service_config {
+    available_memory                 = "1024Mi"
+    timeout_seconds                  = 120
+    max_instance_count               = 10
+    environment_variables = {
+      PROJECT_ID = var.project_id   # optional
+    }
+  }
+
+  event_trigger {
+    trigger_region = "us-central1"
+    event_type     = "google.cloud.storage.object.v1.finalized"
+    event_filters {
+      attribute = "bucket"
+      value     = google_storage_bucket.photos.name
+    }
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+}
+
+# Optional: IAM so function can write to BigQuery
+resource "google_project_iam_member" "function_bigquery" {
+  project = "YOUR_PROJECT_ID"
+  role    = "roles/bigquery.dataEditor"
+  member  = "serviceAccount:${google_cloudfunctions2_function.photo_fraud_trigger.service_config[0].service_account_email}"
+}
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+```
+
+**How to use:**
+1. Create a folder next to `main.tf` called **`function_code/`**
+2. Inside it, put the exact `main.py` and `requirements.txt` from my previous message (the upgraded version with `google-cloud-vision`).
+3. Run:
+   ```bash
+   terraform init
+   terraform apply -auto-approve
+   ```
+
+Terraform now fully handles the new reverse-image code automatically.
+
+### 2. Full BigQuery View for Claims Team (Ready-to-Run)
+
+Run this SQL in BigQuery once (it creates a clean, easy-to-use view):
+
+```sql
+CREATE OR REPLACE VIEW `fraud_detection.claims_team_dashboard` AS
+SELECT
+  c.contract_id,
+  c.claim_id,
+  c.claim_date,
+  c.reported_loss_date,
+  c.service_drive_location,
+  c.service_drive_coords,
+
+  -- Gemini Analysis (flattened)
+  c.risk_score,
+  ARRAY_TO_STRING(c.red_flags, ' | ') AS red_flags_list,
+  JSON_VALUE(c.gemini_analysis, '$.explanation') AS gemini_explanation,
+  JSON_VALUE(c.gemini_analysis, '$.recommendation') AS recommendation,
+
+  -- Auto-detected changes (from Gemini JSON)
+  JSON_VALUE(c.gemini_analysis, '$.red_flags[0]') LIKE '%tire%'
+    OR JSON_VALUE(c.gemini_analysis, '$.red_flags[1]') LIKE '%tire%' AS tire_brand_changed,
+  JSON_VALUE(c.gemini_analysis, '$.red_flags[0]') LIKE '%color%'
+    OR JSON_VALUE(c.gemini_analysis, '$.red_flags[1]') LIKE '%color%' AS vehicle_color_changed,
+
+  -- Reverse Image Results (flattened)
+  JSON_VALUE(c.reverse_image_results, '$.full_matching_images[0]') IS NOT NULL AS has_exact_web_match,
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(c.reverse_image_results, '$.full_matching_images')) AS full_match_count,
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(c.reverse_image_results, '$.visually_similar_images')) AS similar_images_count,
+  JSON_VALUE(c.reverse_image_results, '$.pages_with_matching_images[0]') AS first_matching_page,
+
+  -- Metadata
+  JSON_VALUE(c.extracted_metadata, '$.DateTimeOriginal') AS photo_timestamp,
+  JSON_VALUE(c.extracted_metadata, '$.gps_location') AS photo_gps,
+  c.photo_uris[SAFE_OFFSET(0)] AS latest_photo_uri,
+  c.processed_at,
+
+  -- Historical context for this contract (last 3 claims)
+  ARRAY_AGG(
+    STRUCT(
+      prev.claim_date AS prev_claim_date,
+      prev.risk_score AS prev_risk_score
+    )
+    ORDER BY prev.claim_date DESC
+  ) OVER (PARTITION BY c.contract_id ORDER BY c.claim_date ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS recent_history
+
+FROM `fraud_detection.claims` c
+LEFT JOIN `fraud_detection.claims` prev
+  ON c.contract_id = prev.contract_id
+  AND prev.claim_date < c.claim_date
+ORDER BY c.contract_id, c.claim_date DESC;
+```
+
+**How your claims team uses it:**
+- Open BigQuery → Explore → `claims_team_dashboard`
+- Filter by `risk_score > 70` or `tire_brand_changed = TRUE`
+- Export to Looker Studio / Google Sheets / Data Studio in one click
+- All red flags, reverse-image hits, and historical changes are instantly visible
+
+You now have:
+- Fully automatic pipeline (EXIF + reverse image on every upload)
+- Terraform that auto-deploys the upgraded function
+- One beautiful view for the entire claims department
+
+Would you like me to:
+- Add a second materialized view for daily fraud summary emails?
+- Include the exact Cloud Function code again in a downloadable format?
+- Or give you the Looker Studio dashboard template link?
+
+Just let me know and I’ll drop the next piece instantly. You’re ready to go live! 🚀

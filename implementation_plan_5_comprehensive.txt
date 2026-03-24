@@ -1,0 +1,2920 @@
+================================================================================
+  IMPLEMENTATION PLAN 5 — COMPREHENSIVE
+  Claims Photo Fraud Detection System
+  GCP Production Architecture
+  March 2026
+================================================================================
+
+This document consolidates all concrete implementation details from plans 1–4
+into a single, comprehensive, build-ready reference. Architecture: GCP-native
+production deployment — Cloud Run containers, Cloud SQL Postgres, GCS photo
+storage, Gemini Enterprise AI analysis, Cloud Vision reverse image lookup,
+EXIF extraction, React SPA dashboard, and full operational tooling.
+
+Numbering convention: Sections are numbered (1–21). Points within each section
+are lettered (A, B, C...). These identifiers (e.g. "3C", "7B") will map
+directly to the architectural diagram.
+
+
+================================================================================
+SECTION 1 — HIGH-LEVEL ARCHITECTURE
+================================================================================
+The system is a GCP-native containerized pipeline that ingests claim photos
+from Google Cloud Storage, extracts metadata, runs AI fraud analysis, and
+surfaces results through a React SPA dashboard — all running on Cloud Run
+with Cloud SQL Postgres.
+
+A. System Flow Overview
+
+    ┌─────────────────────────────────────────────────────────┐
+    │  External Portal (future)                               │
+    │  OR Claims Team uploads via React SPA Dashboard         │
+    └────────────────────────┬────────────────────────────────┘
+                             |
+                             v
+    ┌──── Cloud Run: nginx (reverse proxy + SPA host) ────────┐
+    │  Routes:                                                 │
+    │    /              → React SPA (dashboard)                │
+    │    /api/*         → Cloud Run: api (FastAPI)             │
+    │    /external/*    → Cloud Run: api (external, future)    │
+    └────────────────────────┬─────────────────────────────────┘
+                             |
+                             v
+    ┌──── Cloud Run: api (FastAPI) ────────────────────────────┐
+    │  [1A-i]   Upload endpoints (accept photos, queue jobs)   │
+    │  [1A-ii]  Results endpoints (claims, history, photos)    │
+    │  [1A-iii] Q&A endpoint (ask Gemini about a photo)        │
+    │  [1A-iv]  Prompt CRUD (manage system prompts)            │
+    │  [1A-v]   Dashboard data endpoints (for React SPA)       │
+    │  [1A-vi]  Auth (session-based login, POC phase)          │
+    └────────────────────────┬─────────────────────────────────┘
+                             | (writes job to Cloud SQL queue)
+              ┌──────────────+──────────────┐
+              v                              v
+    ┌──── GCS → Pub/Sub ──┐    ┌──── Cloud Run: worker ───────┐
+    │  Photo upload event  │───→│  [1A-vii]  EXIF Extraction   │
+    │  triggers processing │    │  [1A-viii] Cloud Vision      │
+    └──────────────────────┘    │  [1A-ix]  Gemini Analysis    │
+                                │  [1A-x]   Store in Cloud SQL │
+                                │  [1A-xi]  Exchange email     │
+                                └────────────┬─────────────────┘
+                                             |
+                  ┌──────────────────────────+──────────────┐
+                  v                                          v
+    ┌──── Cloud SQL (Postgres 17) ────┐     ┌──── GCS ─────────────┐
+    │  Claims data                     │     │  Claim photos         │
+    │  System prompts                  │     │  Golden test dataset  │
+    │  Users                           │     │                       │
+    │  Performance metrics / logs       │     │                       │
+    │  Batch jobs queue                │     │                       │
+    └──────────────────────────────────┘     └───────────────────────┘
+
+B. Key Design Principles
+
+    - Script-first build process: ALL changes go through scripts — no hotpatches
+    - GCP-native: Cloud Run + Cloud SQL + GCS + Gemini + Cloud Vision
+    - Multi-service architecture: nginx, api, worker (each a Cloud Run service)
+    - Cloud SQL Postgres for all structured data
+    - GCS for all photo storage (Gemini/Vision read directly from GCS)
+    - Secrets in GCP Secret Manager (never in env vars or code)
+    - API/Worker split: fast user responses, heavy AI work runs async
+    - React SPA dashboard served by nginx Cloud Run service
+    - System prompts stored in DB and managed via CRUD endpoints
+    - GCS → Pub/Sub → Cloud Run for event-driven photo processing
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  OPERATIONAL MANDATE: SCRIPT-FIRST, NO HOTPATCHES                   │
+    │                                                                      │
+    │  This system is built and maintained entirely through scripts.       │
+    │  There are no manual changes to running services. Ever.             │
+    │                                                                      │
+    │  - provision.sh creates all GCP infrastructure (Section 17A)        │
+    │  - deploy.sh builds images and deploys to Cloud Run (Section 17B)   │
+    │  - seed.py populates initial data (Section 18)                      │
+    │  - init_db.sql defines the schema (Section 7)                       │
+    │  - Terraform manages all cloud resources (Section 10)               │
+    │                                                                      │
+    │  If something is broken: fix the script, rerun the script.          │
+    │  If data needs resetting: fix the seed, rerun the seed.             │
+    │  If infra needs changing: fix the Terraform, reapply.               │
+    │                                                                      │
+    │  No SSH into containers. No manual SQL against prod. No gcloud      │
+    │  run deploy typed by hand in a terminal. Everything is scripted,    │
+    │  repeatable, and version-controlled.                                │
+    └──────────────────────────────────────────────────────────────────────┘
+
+C. Component Summary
+
+    | Component              | Technology                    | GCP Service      | Section |
+    |------------------------|-------------------------------|------------------|--------|
+    | Photo Storage          | Google Cloud Storage (GCS)    | GCS              | 2      |
+    | Event Trigger          | GCS → Pub/Sub → Cloud Run     | Pub/Sub          | 3      |
+    | EXIF Extraction        | Pillow (Python)               | Cloud Run: worker| 4      |
+    | Reverse Image Lookup   | Google Cloud Vision API       | Cloud Run: worker| 5      |
+    | AI Fraud Analysis      | Gemini Enterprise (Vertex AI) | Cloud Run: worker| 6      |
+    | Data Store             | PostgreSQL 17                 | Cloud SQL        | 7      |
+    | Dashboard SQL Views    | Postgres views                | Cloud SQL        | 8      |
+    | Container Build/Deploy | Docker + Artifact Registry    | Cloud Build      | 9      |
+    | Infrastructure-as-Code | Terraform (GCP)               | —                | 10     |
+    | Batch Processing       | Async worker / queue          | Cloud Run: worker| 11     |
+    | Deployment             | Cloud Run                     | Cloud Run        | 12     |
+    | Prompt Management      | Cloud SQL + CRUD endpoints    | Cloud Run: api   | 13     |
+    | API Endpoints          | FastAPI                       | Cloud Run: api   | 14     |
+    | React SPA Dashboard    | React + nginx                 | Cloud Run: nginx | 15     |
+    | External Portal API    | FastAPI (secured, future)     | Cloud Run: api   | 16     |
+    | Ops Scripts            | Bash / Python                 | local / CI       | 17     |
+    | Seeder & Auth          | Python + Cloud SQL            | Cloud Run: api   | 18     |
+    | Performance Monitoring | Cloud SQL tables + golden data| Cloud Run: worker| 19     |
+    | Pipeline Logging       | Structured logs + Cloud SQL   | all              | 20     |
+    | Email Service          | Exchange / EWS via Python     | Cloud Run: worker| 21     |
+
+
+================================================================================
+SECTION 2 — PHOTO STORAGE (GOOGLE CLOUD STORAGE)
+================================================================================
+All claim photos are stored in Google Cloud Storage (GCS). Gemini and Cloud
+Vision read directly from GCS URIs — no downloads, no copies, no extra cost.
+
+A. Storage Layout Convention
+
+    gs://{PROJECT_ID}-claim-photos/
+    ├── {contract_id}/
+    │   ├── {claim_id}/
+    │   │   ├── photo_001.jpg
+    │   │   ├── photo_002.jpg
+    │   │   └── ...
+    │   ├── {claim_id_2}/
+    │   │   └── ...
+    │   └── ...
+    └── golden/                    # golden test dataset (Section 19)
+        ├── recycled_01.jpg
+        └── ...
+
+    Example: gs://myproject-claim-photos/contract_ABC123456/claim_001/photo_001.jpg
+
+B. Bucket Setup
+
+    Created by Terraform (Section 10C) via provision.sh (Section 17A).
+    Terraform creates the bucket with uniform access, versioning, and
+    lifecycle rules, plus the Pub/Sub notification for OBJECT_FINALIZE.
+
+    Bucket name convention: gs://{PROJECT_ID}-claim-photos/
+
+C. GCS Python Client (used in api + worker)
+
+    ```python
+    from google.cloud import storage
+
+    def upload_photo(bucket_name: str, object_key: str, file_bytes: bytes):
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_key)
+        blob.upload_from_string(file_bytes, content_type="image/jpeg")
+        return f"gs://{bucket_name}/{object_key}"
+
+    def download_photo(bucket_name: str, object_key: str) -> bytes:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_key)
+        return blob.download_as_bytes()
+
+    def generate_signed_url(bucket_name: str, object_key: str, minutes: int = 60) -> str:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_key)
+        return blob.generate_signed_url(expiration=timedelta(minutes=minutes))
+    ```
+
+D. Photo Retention & Compliance
+
+    - Encrypted at rest (Google-managed keys by default, CMEK optional)
+    - Access logging enabled on bucket
+    - Retention policies configurable per compliance needs (SOC 2, GDPR, HIPAA)
+    - Data is NEVER used to train AI models (Gemini Enterprise guarantee)
+    - Lifecycle rules: archive to Coldline/Archive after N months if desired
+    - Uniform bucket-level access (no per-object ACLs)
+    - VPC Service Controls available for network-level isolation
+
+
+================================================================================
+SECTION 3 — EVENT TRIGGER (GCS → PUB/SUB → CLOUD RUN)
+================================================================================
+When a new photo lands in GCS, a Pub/Sub notification triggers the worker
+Cloud Run service to begin processing. This is fully managed — no polling.
+
+A. GCS → Pub/Sub Event Flow
+
+    1. Photo uploaded to GCS bucket (via API, portal, or gsutil)
+    2. GCS fires OBJECT_FINALIZE event to Pub/Sub topic "photo-uploads"
+    3. Pub/Sub push subscription sends POST to worker Cloud Run URL
+    4. Worker receives event, extracts bucket + object key, begins processing
+
+    Pub/Sub payload (GCS notification format):
+    ```json
+    {
+      "message": {
+        "attributes": {
+          "bucketId": "myproject-claim-photos",
+          "objectId": "contract_ABC123/claim_001/photo_001.jpg",
+          "eventType": "OBJECT_FINALIZE"
+        }
+      }
+    }
+    ```
+
+    Setup: Managed by Terraform (Section 10) and deploy.sh (Section 17B).
+    Terraform creates the topic, subscription, and GCS notification.
+    deploy.sh wires the subscription's push endpoint to the worker URL.
+
+B. Worker Webhook Handler
+
+    ```python
+    @app.post("/webhook/photo-uploaded")
+    async def handle_photo_event(request: Request):
+        """Receive GCS → Pub/Sub push notification."""
+        envelope = await request.json()
+        attrs = envelope["message"]["attributes"]
+        bucket = attrs["bucketId"]
+        object_key = attrs["objectId"]
+
+        # Queue for processing (or process inline for single photos)
+        await queue_photo_job(bucket, object_key)
+        return {"status": "accepted"}
+    ```
+
+C. Claim Aggregation (Photo-Level → Claim-Level)
+
+    Pub/Sub fires per-photo (OBJECT_FINALIZE), but Gemini analysis runs
+    per-claim across all photos for that claim. The worker handles this
+    in two stages:
+
+    1. Per-photo stage (runs on every Pub/Sub event):
+       - Extract contract_id + claim_id from the object path (Section 4D)
+       - Extract EXIF metadata from the single photo (Section 4)
+       - Run Cloud Vision reverse image lookup on the single photo (Section 5)
+       - Store per-photo results in processed_photos
+
+    2. Claim-level stage (runs once all photos for a claim are ready):
+       - Check if all expected photos for the claim have been processed
+       - Gather all per-photo EXIF + Vision results from processed_photos
+       - Fetch contract history from claims table (Section 7C)
+       - Build the Gemini prompt with ALL photos for the claim (Section 6B)
+       - Call Gemini once per claim (not per photo)
+       - Store aggregated results in claims table (Section 7D)
+       - Fire email alert if risk_score >= 80 (Section 21D)
+
+    ```python
+    async def process_photo_and_maybe_analyze_claim(bucket: str, object_key: str, db):
+        """Per-photo processing, then claim-level Gemini analysis if all photos are ready."""
+        ids = extract_ids_from_path(object_key)
+        gs_uri = f"gs://{bucket}/{object_key}"
+
+        # Stage 1: per-photo processing
+        image_bytes = download_photo(bucket, object_key)
+        exif_data = extract_exif(image_bytes)
+        vision_results = reverse_image_lookup(gs_uri)
+
+        db.execute("""
+            INSERT INTO processed_photos (storage_key, contract_id, claim_id, status)
+            VALUES (%s, %s, %s, 'completed')
+            ON CONFLICT (storage_key) DO NOTHING
+        """, [object_key, ids["contract_id"], ids["claim_id"]])
+        db.commit()
+
+        # Stage 2: check if claim is ready for Gemini analysis
+        # A claim is ready when no new photos have arrived for 30 seconds,
+        # OR when triggered explicitly by the API's upload endpoint.
+        await maybe_trigger_claim_analysis(ids["contract_id"], ids["claim_id"], db)
+    ```
+
+    This ensures Gemini sees the full picture (all photos for a claim)
+    rather than analyzing one photo at a time.
+
+D. Idempotency
+
+    Every photo is tracked by its GCS object key. If a photo has already
+    been processed (exists in the `processed_photos` table), it is skipped.
+    This prevents duplicate processing on Pub/Sub redeliveries.
+
+
+================================================================================
+SECTION 4 — EXIF METADATA EXTRACTION
+================================================================================
+Every uploaded photo is immediately parsed for EXIF metadata. This is the first
+processing step and provides the timestamp, GPS, and device data needed for
+fraud cross-referencing.
+
+A. Extracted Fields
+
+    | EXIF Tag          | Use Case                                     |
+    |-------------------|----------------------------------------------|
+    | DateTimeOriginal  | Compare to reported loss date                |
+    | GPSInfo (lat/lon) | Compare to service drive location            |
+    | Make / Model      | Device fingerprinting across claims          |
+    | Software          | Detect photo editing software                |
+    | ImageWidth/Height | Consistency checks                           |
+    | All other tags    | Stored as JSON for future analysis           |
+
+B. EXIF Extraction Code
+
+    ```python
+    import io
+    import json
+    from PIL import Image, ExifTags
+
+    def extract_exif(image_bytes: bytes) -> dict:
+        """Extract all EXIF metadata from image bytes."""
+        img = Image.open(io.BytesIO(image_bytes))
+        exif = img.getexif()
+        metadata = {}
+
+        if exif:
+            for tag_id, value in exif.items():
+                tag = ExifTags.TAGS.get(tag_id, tag_id)
+                if tag == "GPSInfo":
+                    gps = parse_gps(value)
+                    metadata["gps_lat"] = gps["lat"]
+                    metadata["gps_lon"] = gps["lon"]
+                    metadata["gps_location"] = f"{gps['lat']},{gps['lon']}"
+                elif isinstance(value, bytes):
+                    metadata[tag] = value.decode(errors="ignore")
+                else:
+                    metadata[tag] = str(value)
+
+        return metadata
+    ```
+
+C. GPS Coordinate Parsing (DMS → Decimal Degrees)
+
+    ```python
+    def parse_gps(gps_info) -> dict:
+        """Convert EXIF GPS DMS (degrees/minutes/seconds) to decimal degrees."""
+        def dms_to_dd(dms, ref):
+            degrees = dms[0][0] / dms[0][1]
+            minutes = dms[1][0] / dms[1][1]
+            seconds = dms[2][0] / dms[2][1]
+            dd = degrees + minutes / 60 + seconds / 3600
+            return dd if ref in "NE" else -dd
+
+        try:
+            lat = dms_to_dd(gps_info[2], gps_info[1])
+            lon = dms_to_dd(gps_info[4], gps_info[3])
+            return {"lat": lat, "lon": lon}
+        except (KeyError, IndexError, TypeError, ZeroDivisionError):
+            return {"lat": None, "lon": None}
+    ```
+
+D. Contract/Claim ID Extraction from File Path
+
+    ```python
+    def extract_ids_from_path(object_key: str) -> dict:
+        """
+        Extract contract and claim IDs from the storage path.
+        Expected format: {contract_id}/{claim_id}/filename.jpg
+        Example: contract_ABC123456/claim_001/photo_001.jpg
+        """
+        parts = object_key.strip("/").split("/")
+        return {
+            "contract_id": parts[0] if len(parts) > 0 else "UNKNOWN",
+            "claim_id": parts[1] if len(parts) > 1 else "UNKNOWN",
+            "filename": parts[-1] if parts else object_key,
+        }
+    ```
+
+
+================================================================================
+SECTION 5 — REVERSE IMAGE LOOKUP (CLOUD VISION WEB DETECTION)
+================================================================================
+Google Cloud Vision Web Detection acts as a programmable reverse-image search
+(same technology as Google Images / Google Lens). It identifies if a claim photo
+appears anywhere on the public internet — catching recycled stock photos,
+images pulled from listings, or previously submitted fraud photos.
+
+A. What It Detects
+
+    | Result Type               | What It Means                                 |
+    |---------------------------|-----------------------------------------------|
+    | full_matching_images      | Exact copy found online — strong fraud signal  |
+    | partial_matching_images   | Cropped or modified version found              |
+    | visually_similar_images   | Similar-looking images (may or may not match)  |
+    | pages_with_matching_images| Specific web pages containing the image        |
+    | web_entities              | Topics/labels Google associates with the image |
+
+B. Integration Code (GCS URI — native)
+
+    ```python
+    from google.cloud import vision
+
+    def reverse_image_lookup(gs_uri: str) -> dict:
+        """
+        Run Google Cloud Vision Web Detection on a GCS image.
+        gs_uri example: gs://myproject-claim-photos/contract_ABC/claim_001/photo.jpg
+        """
+        vision_client = vision.ImageAnnotatorClient()
+        image = vision.Image(source=vision.ImageSource(image_uri=gs_uri))
+
+        response = vision_client.annotate_image({
+            "image": image,
+            "features": [{"type_": vision.Feature.Type.WEB_DETECTION}]
+        })
+
+        web = response.web_detection
+        return {
+            "full_matching_images": [
+                img.url for img in web.full_matching_images
+            ],
+            "partial_matching_images": [
+                img.url for img in web.partial_matching_images
+            ],
+            "visually_similar_images": [
+                img.url for img in web.visually_similar_images
+            ],
+            "pages_with_matching_images": [
+                page.url for page in web.pages_with_matching_images
+            ],
+            "web_entities": [
+                {"entity": e.description, "score": e.score}
+                for e in web.web_entities
+            ],
+        }
+    ```
+
+C. When to Run (Cost Control)
+
+    - Default: Run on EVERY photo (~$1.50–$2.00 per 1,000 images)
+    - Cost-optimized: Run only on Gemini-flagged photos (risk_score > threshold)
+    - At 100K photos/month: ~$150–$200/month — negligible vs. fraud savings
+    - Toggle via env var: ENABLE_CLOUD_VISION=true|false
+
+D. Authentication
+
+    - Cloud Run services auto-authenticate to Cloud Vision via service account
+    - Cloud Vision API must be enabled on the GCP project
+    - No separate credentials file needed when running on GCP
+
+
+================================================================================
+SECTION 6 — GEMINI ENTERPRISE FRAUD ANALYSIS
+================================================================================
+Gemini Enterprise is the AI brain of the system. It performs deep multimodal
+analysis: comparing current claim photos against contract history, detecting
+tire brand changes, vehicle color swaps, recycled damage, staged photos,
+geo/timestamp mismatches, and more.
+
+A. System Instruction (set once in model config)
+
+    "You are a senior insurance fraud investigator with 20 years of experience.
+     Be extremely strict and factual. Never speculate without evidence.
+     Always cite specific visual details to support your findings."
+
+B. Per-Claim Prompt Template
+
+    ```text
+    Analyze these photos for fraud indicators.
+
+    CONTRACT: {contract_id}
+
+    PREVIOUS CLAIMS (last 24 months):
+    {for each previous claim:}
+      - Claim {claim_id} on {date}: {photo descriptions, tire brand, vehicle
+        color, damage summary from previous Gemini analysis}
+    {end for}
+
+    CURRENT CLAIM:
+      Claim ID: {claim_id}
+      Reported Loss Date: {reported_loss_date}
+      Service Drive Location: {service_drive_location}
+      Service Drive Coordinates: {service_drive_coords}
+      Photo EXIF Timestamp: {exif_datetime}
+      Photo GPS: {exif_gps_lat}, {exif_gps_lon}
+      Reverse Image Hits: {count of full_matching_images} exact matches,
+                          {count of visually_similar_images} similar
+
+    PHOTOS (newest first):
+      [Image 1: current claim photo]
+      [Image 2..N: previous claim photos for this contract]
+
+    REQUIRED ANALYSIS:
+      1. Extract visible tire brand(s) from ALL photos (read logos/text).
+      2. Extract vehicle color from ALL photos.
+      3. Check for recycled/duplicate images (identical damage, lighting,
+         angle, background).
+      4. Assess damage authenticity (fresh vs. staged — shadows, physics,
+         editing artifacts, healing patterns).
+      5. Flag inconsistencies: tire brand change, color change, damage
+         impossible to reconcile with timeline.
+      6. Compare EXIF GPS to service drive coords — flag if >5 miles apart.
+      7. Compare EXIF timestamp to reported loss date — flag if >48 hrs.
+      8. Note any reverse image search hits as strong fraud indicators.
+      9. Overall fraud risk score (0–100).
+
+    RESPOND WITH ONLY VALID JSON:
+    {
+      "risk_score": 85,
+      "red_flags": [
+        "Tire brand changed: Michelin (claim 2024-03) → Goodyear (current)",
+        "Vehicle color inconsistency: blue in prior photos, appears repainted"
+      ],
+      "tire_brands_detected": {
+        "current": "Goodyear",
+        "previous": ["Michelin", "Michelin"]
+      },
+      "vehicle_colors_detected": {
+        "current": "dark blue (possible respray)",
+        "previous": ["blue", "blue"]
+      },
+      "damage_assessment": "Fresh scratches consistent with reported incident",
+      "geo_timestamp_check": {
+        "gps_vs_service_drive": "MATCH (0.3 miles)",
+        "timestamp_vs_loss_date": "MISMATCH (photo taken 5 days before loss)"
+      },
+      "reverse_image_flag": false,
+      "explanation": "Tire brand changed between claims with no explanation...",
+      "recommendation": "Manual review — tire brand change across claims"
+    }
+    ```
+
+C. Calling Gemini from Python (google-generativeai SDK)
+
+    ```python
+    import google.generativeai as genai
+
+    def analyze_claim_with_gemini(
+        prompt: str,
+        image_bytes_list: list[bytes],
+        api_key: str,
+        model: str = "gemini-2.5-flash",
+    ) -> dict:
+        """
+        Send claim photos + prompt to Gemini for fraud analysis.
+        Returns parsed JSON response.
+        """
+        genai.configure(api_key=api_key)
+
+        # System instruction loaded from DB (Section 13)
+        system_prompt = get_active_prompt(db_session, "fraud_system_instruction")
+
+        model_instance = genai.GenerativeModel(
+            model_name=model,
+            system_instruction=system_prompt,
+        )
+
+        # Build multimodal content: text prompt + images
+        content_parts = [prompt]
+        for img_bytes in image_bytes_list:
+            content_parts.append({
+                "mime_type": "image/jpeg",
+                "data": img_bytes,
+            })
+
+        response = model_instance.generate_content(content_parts)
+
+        # Parse JSON from response
+        import json
+        return json.loads(response.text)
+    ```
+
+D. Batch Processing at Scale (100K+ photos)
+
+    For bulk back-testing or nightly runs across the full photo corpus:
+
+    Strategy 1 — Async Worker Queue (used in this system):
+      - Postgres-backed batch_jobs queue (Section 11A)
+      - Workers pull claims from queue, call Gemini per-claim
+      - Rate-limit to stay within API quotas
+      - Handles 200K+ photos in parallel workers
+
+    Strategy 2 — Vertex AI Batch Inference (GCP-native option):
+      - Generate JSONL file with one request per line
+      - Upload to GCS
+      - Submit batch job via Vertex AI API
+      - Results land in GCS → parse and load into Cloud SQL Postgres
+      - ~50% cheaper than real-time calls
+      - Single job handles 200,000+ requests
+
+    JSONL format for Vertex AI Batch:
+    ```json
+    {"request": {"contents": [{"role": "user", "parts": [{"text": "..."}, {"inline_data": {"mime_type": "image/jpeg", "data": "base64..."}}]}]}}
+    ```
+
+E. Model Selection
+
+    | Model              | Use Case             | Speed   | Cost       |
+    |--------------------|----------------------|---------|------------|
+    | gemini-2.5-flash   | High volume / batch  | Fast    | Lowest     |
+    | gemini-2.5-pro     | Complex/borderline   | Slower  | ~3x flash  |
+
+    Recommended: Use Flash for all claims, escalate to Pro for risk_score > 70.
+
+F. Cost at Scale
+
+    - Gemini Flash batch: ~$0.01–0.03 per photo (with images)
+    - At 100K photos/month: ~$1,000–$3,000/month
+    - Real-time (per new claim): near-instant, slightly higher per-call
+    - Compare to: Avantia's projected £1.2M annual savings from fraud detection
+
+
+================================================================================
+SECTION 7 — DATABASE SCHEMA (POSTGRESQL)
+================================================================================
+PostgreSQL 17 on Cloud SQL is the primary data store. It handles the
+contract-level historical queries needed for fraud detection with proper
+relational modeling, JSONB for AI responses, and FOR UPDATE SKIP LOCKED for queues.
+
+    NOTE: SQL snippets in Sections 7–8, 11, 13, and 19–20 use raw SQL with %s
+    placeholders for readability. In actual code, all queries run through the
+    shared db.py helper (Section 9J) using SQLAlchemy text() with named params:
+        db.execute(text("SELECT * FROM claims WHERE contract_id = :cid"), {"cid": val})
+
+A. Core Claims Table
+
+    ```sql
+    CREATE TABLE claims (
+        id                      SERIAL PRIMARY KEY,
+        contract_id             VARCHAR(100) NOT NULL,
+        claim_id                VARCHAR(100) NOT NULL,
+        claim_date              DATE,
+        reported_loss_date      DATE,
+        service_drive_location  TEXT,
+        service_drive_coords    VARCHAR(50),       -- "lat,lon"
+        photo_uris              TEXT[],             -- array of storage paths
+        extracted_metadata      JSONB,              -- full EXIF as JSON
+        reverse_image_results   JSONB,              -- Cloud Vision Web Detection
+        gemini_analysis         JSONB,              -- full Gemini JSON response
+        risk_score              REAL,
+        red_flags               TEXT[],             -- array of flag strings
+        processed_at            TIMESTAMPTZ DEFAULT NOW(),
+
+        UNIQUE(contract_id, claim_id)
+    );
+
+    -- Index for contract-level history lookups
+    CREATE INDEX idx_claims_contract ON claims(contract_id, claim_date DESC);
+
+    -- Index for high-risk claim filtering
+    CREATE INDEX idx_claims_risk ON claims(risk_score DESC) WHERE risk_score > 50;
+    ```
+
+B. Processed Photos Tracking Table (idempotency)
+
+    ```sql
+    CREATE TABLE processed_photos (
+        id              SERIAL PRIMARY KEY,
+        storage_key     TEXT UNIQUE NOT NULL,    -- full object path
+        contract_id     VARCHAR(100),
+        claim_id        VARCHAR(100),
+        processed_at    TIMESTAMPTZ DEFAULT NOW(),
+        status          VARCHAR(20) DEFAULT 'completed'  -- completed, failed, pending
+    );
+    ```
+
+C. Fetching Contract History for Gemini Prompt
+
+    ```sql
+    -- Get all previous claims for a contract (to feed into Gemini prompt)
+    SELECT
+        claim_id,
+        claim_date,
+        risk_score,
+        red_flags,
+        gemini_analysis->>'tire_brands_detected' AS tire_brands,
+        gemini_analysis->>'vehicle_colors_detected' AS vehicle_colors,
+        gemini_analysis->>'damage_assessment' AS damage_summary,
+        photo_uris
+    FROM claims
+    WHERE contract_id = $1
+      AND claim_date < $2
+    ORDER BY claim_date DESC
+    LIMIT 10;
+    ```
+
+D. Insert/Upsert a Processed Claim
+
+    ```sql
+    INSERT INTO claims (
+        contract_id, claim_id, claim_date, reported_loss_date,
+        service_drive_location, service_drive_coords,
+        photo_uris, extracted_metadata, reverse_image_results,
+        gemini_analysis, risk_score, red_flags
+    ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+    )
+    ON CONFLICT (contract_id, claim_id)
+    DO UPDATE SET
+        photo_uris = claims.photo_uris || EXCLUDED.photo_uris,
+        extracted_metadata = EXCLUDED.extracted_metadata,
+        reverse_image_results = EXCLUDED.reverse_image_results,
+        gemini_analysis = EXCLUDED.gemini_analysis,
+        risk_score = EXCLUDED.risk_score,
+        red_flags = EXCLUDED.red_flags,
+        processed_at = NOW();
+    ```
+
+
+================================================================================
+SECTION 8 — CLAIMS TEAM DASHBOARD (SQL VIEWS)
+================================================================================
+A flattened, human-readable view that the claims team queries directly or
+connects to a BI tool (Metabase, Grafana, Looker Studio, Superset, etc.).
+
+A. Claims Dashboard View (PostgreSQL)
+
+    ```sql
+    CREATE OR REPLACE VIEW claims_dashboard AS
+    SELECT
+        c.contract_id,
+        c.claim_id,
+        c.claim_date,
+        c.reported_loss_date,
+        c.service_drive_location,
+        c.service_drive_coords,
+
+        -- Risk & Flags
+        c.risk_score,
+        array_to_string(c.red_flags, ' | ') AS red_flags_list,
+
+        -- Gemini Analysis (flattened)
+        c.gemini_analysis->>'explanation' AS gemini_explanation,
+        c.gemini_analysis->>'recommendation' AS recommendation,
+        c.gemini_analysis->>'damage_assessment' AS damage_assessment,
+        c.gemini_analysis->'tire_brands_detected'->>'current' AS current_tire_brand,
+        c.gemini_analysis->'vehicle_colors_detected'->>'current' AS current_vehicle_color,
+
+        -- Change Detection (derived booleans)
+        (c.gemini_analysis->'tire_brands_detected'->>'current') IS DISTINCT FROM
+            (c.gemini_analysis->'tire_brands_detected'->'previous'->>0)
+            AS tire_brand_changed,
+        (c.gemini_analysis->'vehicle_colors_detected'->>'current') IS DISTINCT FROM
+            (c.gemini_analysis->'vehicle_colors_detected'->'previous'->>0)
+            AS vehicle_color_changed,
+
+        -- Geo/Timestamp Checks
+        c.gemini_analysis->'geo_timestamp_check'->>'gps_vs_service_drive'
+            AS gps_match_status,
+        c.gemini_analysis->'geo_timestamp_check'->>'timestamp_vs_loss_date'
+            AS timestamp_match_status,
+
+        -- Reverse Image Results (flattened)
+        jsonb_array_length(
+            COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
+        ) AS exact_web_matches,
+        jsonb_array_length(
+            COALESCE(c.reverse_image_results->'visually_similar_images', '[]'::jsonb)
+        ) AS similar_web_images,
+        c.reverse_image_results->'pages_with_matching_images'->>0
+            AS first_matching_page,
+        jsonb_array_length(
+            COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
+        ) > 0 AS has_exact_web_match,
+
+        -- Photo Metadata
+        c.extracted_metadata->>'DateTimeOriginal' AS photo_timestamp,
+        c.extracted_metadata->>'gps_location' AS photo_gps,
+        c.extracted_metadata->>'Make' AS camera_make,
+        c.extracted_metadata->>'Model' AS camera_model,
+        c.photo_uris[1] AS latest_photo_uri,
+        c.processed_at
+
+    FROM claims c
+    ORDER BY c.risk_score DESC NULLS LAST, c.claim_date DESC;
+    ```
+
+B. Contract History View (for investigating a single contract)
+
+    ```sql
+    CREATE OR REPLACE VIEW contract_history AS
+    SELECT
+        c.contract_id,
+        c.claim_id,
+        c.claim_date,
+        c.risk_score,
+        array_to_string(c.red_flags, ' | ') AS red_flags_list,
+        c.gemini_analysis->'tire_brands_detected'->>'current' AS tire_brand,
+        c.gemini_analysis->'vehicle_colors_detected'->>'current' AS vehicle_color,
+        c.gemini_analysis->>'damage_assessment' AS damage_summary,
+        cardinality(c.photo_uris) AS photo_count,
+        c.claim_date - LAG(c.claim_date) OVER (
+            PARTITION BY c.contract_id ORDER BY c.claim_date
+        ) AS days_since_last_claim
+    FROM claims c
+    ORDER BY c.contract_id, c.claim_date DESC;
+    ```
+
+C. Daily Fraud Summary View
+
+    ```sql
+    CREATE OR REPLACE VIEW daily_fraud_summary AS
+    SELECT
+        DATE(processed_at) AS process_date,
+        COUNT(*) AS total_claims_processed,
+        COUNT(*) FILTER (WHERE risk_score >= 70) AS high_risk_count,
+        COUNT(*) FILTER (WHERE risk_score BETWEEN 40 AND 69) AS medium_risk_count,
+        COUNT(*) FILTER (WHERE risk_score < 40) AS low_risk_count,
+        ROUND(AVG(risk_score)::numeric, 1) AS avg_risk_score,
+        COUNT(*) FILTER (WHERE
+            jsonb_array_length(
+                COALESCE(reverse_image_results->'full_matching_images', '[]'::jsonb)
+            ) > 0
+        ) AS claims_with_web_matches
+    FROM claims
+    GROUP BY DATE(processed_at)
+    ORDER BY process_date DESC;
+    ```
+
+D. Common Queries for Claims Team
+
+    -- All high-risk claims needing review
+    SELECT * FROM claims_dashboard WHERE risk_score >= 70;
+
+    -- Claims with tire brand changes
+    SELECT * FROM claims_dashboard WHERE tire_brand_changed = true;
+
+    -- Claims with exact web image matches (likely recycled photos)
+    SELECT * FROM claims_dashboard WHERE has_exact_web_match = true;
+
+    -- Full history for a specific contract
+    SELECT * FROM contract_history WHERE contract_id = 'ABC123456';
+
+    -- Today's processing summary
+    SELECT * FROM daily_fraud_summary WHERE process_date = CURRENT_DATE;
+
+
+================================================================================
+SECTION 9 — DOCKER IMAGES & GCP DEPLOYMENT
+================================================================================
+The system runs as 3 Cloud Run services (api, worker, nginx/dashboard) backed
+by Cloud SQL Postgres and GCS. Each service has its own Docker image, built
+and pushed to Artifact Registry via Cloud Build.
+
+A. Cloud Run Service Overview
+
+    | Service    | Image                        | Role                                   | URL                     |
+    |------------|------------------------------|----------------------------------------|-------------------------|
+    | nginx      | {REGION}-docker.pkg.dev/...  | Reverse proxy, serves React SPA        | https://nginx-HASH.run  |
+    | api        | {REGION}-docker.pkg.dev/...  | FastAPI — all user-facing endpoints    | https://api-HASH.run    |
+    | worker     | {REGION}-docker.pkg.dev/...  | Background: EXIF, Vision, Gemini, email| https://worker-HASH.run |
+
+    Managed services (no Docker image):
+    | Service         | GCP Product      |
+    |-----------------|------------------|
+    | Database        | Cloud SQL Postgres 17 |
+    | Photo Storage   | GCS              |
+    | Event Bus       | Pub/Sub          |
+    | Secrets         | Secret Manager   |
+    | Image Registry  | Artifact Registry|
+
+B. API Dockerfile (api/Dockerfile)
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    RUN apt-get update && apt-get install -y \
+        libgl1-mesa-glx libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+    ```
+
+C. Worker Dockerfile (worker/Dockerfile)
+
+    Same base as API but different entrypoint:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    RUN apt-get update && apt-get install -y \
+        libgl1-mesa-glx libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["python", "worker.py"]
+    ```
+
+D. Dashboard Dockerfile (dashboard/Dockerfile)
+
+    Multi-stage build: Node builds React, nginx serves static files.
+    The nginx config routes /api/* and /external/* to the api Cloud Run service.
+
+    ```dockerfile
+    # Stage 1: Build React app
+    FROM node:20-alpine AS build
+    WORKDIR /app
+    COPY package*.json ./
+    RUN npm ci
+    COPY . .
+    RUN npm run build
+
+    # Stage 2: Serve with nginx
+    FROM nginx:alpine
+    COPY --from=build /app/dist /usr/share/nginx/html
+    COPY nginx.conf /etc/nginx/templates/default.conf.template
+    EXPOSE 8080
+    ```
+
+    nginx's official Docker image auto-runs envsubst on files in
+    /etc/nginx/templates/ at container start, outputting to
+    /etc/nginx/conf.d/. This resolves ${API_SERVICE_URL} from the
+    environment variable set by deploy.sh (Section 17B) at deploy time.
+    No custom entrypoint needed.
+
+E. requirements.txt (api/requirements.txt)
+
+    The api and worker each have their own requirements.txt (see 9H directory
+    structure). The worker omits fastapi/uvicorn and adds exchangelib; the api
+    omits exchangelib. Both use cloud-sql-python-connector with pg8000 as the
+    database driver (no psycopg2 — the connector handles Cloud SQL auth and
+    socket management natively on Cloud Run).
+
+    api/requirements.txt:
+    ```txt
+    fastapi
+    uvicorn[standard]
+    google-cloud-storage
+    google-generativeai
+    google-cloud-vision
+    pillow
+    pg8000
+    sqlalchemy
+    alembic
+    pydantic
+    python-dotenv
+    python-jose[cryptography]
+    passlib[bcrypt]
+    cloud-sql-python-connector[pg8000]
+    ```
+
+    worker/requirements.txt:
+    ```txt
+    google-cloud-storage
+    google-generativeai
+    google-cloud-vision
+    pillow
+    pg8000
+    sqlalchemy
+    pydantic
+    python-dotenv
+    exchangelib
+    cloud-sql-python-connector[pg8000]
+    ```
+
+F. nginx.conf (reverse proxy — routes API calls to api Cloud Run service)
+
+    ```nginx
+    server {
+        listen 8080;
+        server_name _;
+
+        # React SPA (dashboard)
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri $uri/ /index.html;
+        }
+
+        # Internal API (FastAPI on Cloud Run)
+        location /api/ {
+            proxy_pass ${API_SERVICE_URL}/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # External portal endpoints (future — Section 16)
+        location /external/ {
+            proxy_pass ${API_SERVICE_URL}/external/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+
+    Note: API_SERVICE_URL is set at deploy time via envsubst or Cloud Run
+    service-to-service auth with the api service's URL.
+
+G. Environment Variables (all stored in GCP Secret Manager)
+
+    | Variable                   | Used By | Description                         |
+    |----------------------------|---------|-------------------------------------|
+    | CLOUD_SQL_CONNECTION_NAME  | api,wkr | PROJECT:REGION:INSTANCE for connector|
+    | DB_PASSWORD                | api,wkr | Cloud SQL fraud_user password       |
+    | DB_USER                    | api,wkr | Cloud SQL user (default: fraud_user)|
+    | DB_NAME                    | api,wkr | Database name (default: fraud_detection)|
+    | GEMINI_API_KEY             | api,wkr | Gemini Enterprise API key           |
+    | GEMINI_MODEL               | api,wkr | Model name (default: gemini-2.5-flash)|
+    | GCS_BUCKET                 | api,wkr | GCS bucket name for photos          |
+    | ENABLE_CLOUD_VISION        | worker  | Enable reverse image lookup (true)  |
+    | RISK_THRESHOLD_FOR_PRO     | worker  | Escalate to Gemini Pro above this   |
+    | EXCHANGE_EMAIL             | worker  | Exchange account for email alerts   |
+    | EXCHANGE_PASSWORD          | worker  | Exchange account password           |
+    | EXCHANGE_SERVER            | worker  | Exchange server URL                 |
+    | SESSION_SECRET             | api     | Secret for signing session tokens   |
+    | SESSION_TIMEOUT_MINUTES    | api     | Session expiry (default: 60)        |
+    | ALERT_RECIPIENTS           | worker  | Comma-separated alert email list    |
+
+    All secrets are referenced in Cloud Run via:
+    ```
+    --set-secrets="GEMINI_API_KEY=gemini-api-key:latest"
+    ```
+    Production secrets live in Secret Manager — never in code or container images.
+    A local .env file (git-ignored) holds developer passwords for seeding only.
+
+H. Project Directory Structure
+
+    ```
+    claims_images/
+    ├── .env                        # Local dev secrets (git-ignored) — MILES_PW, GREG_PW, DB_PASSWORD, CLOUD_SQL_CONNECTION_NAME
+    ├── .gitignore                  # Must include .env
+    ├── api/                        # FastAPI Cloud Run service
+    │   ├── Dockerfile
+    │   ├── requirements.txt
+    │   ├── main.py                 # FastAPI app + routes
+    │   ├── db.py                   # Cloud SQL connector + SQLAlchemy engine (Section 9J)
+    │   ├── models/                 # SQLAlchemy models
+    │   ├── routes/                 # Endpoint modules
+    │   │   ├── photos.py
+    │   │   ├── claims.py
+    │   │   ├── prompts.py
+    │   │   ├── auth.py
+    │   │   ├── dashboard.py
+    │   │   └── external.py         # future — Section 16
+    │   └── services/
+    │       ├── storage.py          # GCS client
+    │       ├── gemini.py           # Gemini API calls
+    │       └── auth.py             # Session/token logic
+    ├── worker/                     # Background processor Cloud Run service
+    │   ├── Dockerfile
+    │   ├── requirements.txt
+    │   ├── worker.py               # Main loop (pulls from queue)
+    │   ├── db.py                   # Cloud SQL connector + SQLAlchemy engine (Section 9J)
+    │   └── services/
+    │       ├── exif.py             # EXIF extraction
+    │       ├── vision.py           # Cloud Vision reverse image
+    │       ├── gemini.py           # Gemini fraud analysis
+    │       └── email.py            # Exchange email service
+    ├── dashboard/                  # React SPA + nginx Cloud Run service
+    │   ├── Dockerfile
+    │   ├── package.json
+    │   ├── nginx.conf
+    │   ├── src/
+    │   │   ├── App.tsx
+    │   │   ├── api/                # JS API client (calls FastAPI)
+    │   │   │   └── client.ts
+    │   │   ├── pages/
+    │   │   │   ├── Login.tsx
+    │   │   │   ├── Dashboard.tsx
+    │   │   │   ├── ClaimDetail.tsx
+    │   │   │   ├── ContractHistory.tsx
+    │   │   │   └── PhotoQA.tsx
+    │   │   └── components/
+    ├── scripts/                    # Ops scripts (Section 17)
+    │   ├── provision.sh
+    │   ├── deploy.sh
+    │   ├── health_check.sh
+    │   ├── seed.py
+    │   ├── init_db.sql
+    │   └── test_suite.py
+    └── terraform/                  # IaC (Section 10)
+        ├── main.tf
+        ├── variables.tf
+        └── outputs.tf
+    ```
+
+I. Build & Push Images
+
+    All builds go through deploy.sh (Section 17B). Per the script-first
+    mandate, never run gcloud builds submit by hand.
+
+    ```bash
+    # Build and deploy all 3 services
+    ./scripts/deploy.sh --all
+
+    # Build and deploy only the API
+    ./scripts/deploy.sh api
+    ```
+
+J. Cloud SQL Connector (db.py — shared by api + worker)
+
+    Both the api and worker use the Google Cloud SQL Python Connector with
+    pg8000 as the database driver. This is the GCP-recommended approach for
+    Cloud Run: it handles IAM auth, socket management, and private IP
+    connectivity without manual Unix socket paths or Cloud SQL proxy.
+
+    ```python
+    # db.py — identical in api/ and worker/
+    import os
+    from google.cloud.sql.connector import Connector
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    INSTANCE_CONNECTION_NAME = os.environ["CLOUD_SQL_CONNECTION_NAME"]  # PROJECT:REGION:INSTANCE
+    DB_USER = os.environ.get("DB_USER", "fraud_user")
+    DB_PASS = os.environ["DB_PASSWORD"]
+    DB_NAME = os.environ.get("DB_NAME", "fraud_detection")
+
+    connector = Connector(refresh_strategy="lazy")  # recommended for Cloud Run CPU throttling
+
+    def _getconn():
+        return connector.connect(
+            INSTANCE_CONNECTION_NAME,
+            "pg8000",
+            user=DB_USER,
+            password=DB_PASS,
+            db=DB_NAME,
+        )
+
+    engine = create_engine(
+        "postgresql+pg8000://",
+        creator=_getconn,
+        pool_size=5,
+        pool_recycle=1800,
+    )
+
+    SessionLocal = sessionmaker(bind=engine)
+
+    def get_db():
+        """FastAPI dependency — yields a session, auto-closes."""
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+    ```
+
+    FastAPI usage (in api/main.py):
+    ```python
+    from fastapi import Depends
+    from db import get_db
+    from sqlalchemy.orm import Session
+
+    @app.get("/api/health")
+    def health(db: Session = Depends(get_db)):
+        db.execute(text("SELECT 1"))
+        return {"status": "ok", "db": "connected"}
+    ```
+
+    Worker usage (in worker/worker.py):
+    ```python
+    from db import SessionLocal
+
+    db = SessionLocal()
+    # ... use db.execute(text(...)) ...
+    db.close()
+    ```
+
+    All code snippets in this plan that call db.execute() or db_session.execute()
+    receive a SQLAlchemy Session from this pattern. Use sqlalchemy.text() for
+    raw SQL queries:
+    ```python
+    from sqlalchemy import text
+    result = db.execute(text("SELECT * FROM claims WHERE contract_id = :cid"), {"cid": "ABC123"})
+    ```
+
+
+================================================================================
+SECTION 10 — INFRASTRUCTURE AS CODE (TERRAFORM)
+================================================================================
+Single-provider Terraform config for GCP. Creates all infrastructure:
+Artifact Registry, Cloud SQL, GCS, Pub/Sub, Secret Manager, service
+accounts, IAM bindings, VPC, and networking. Cloud Run services are
+NOT in Terraform — they are managed by deploy.sh (Section 17B).
+
+A. Directory Structure
+
+    ```
+    terraform/
+    ├── main.tf                 # All GCP resources
+    ├── variables.tf            # Project ID, region, secrets
+    └── outputs.tf              # Bucket name, DB connection, service accounts
+    ```
+
+B. variables.tf
+
+    ```hcl
+    variable "project_id" {
+      description = "GCP project ID"
+      type        = string
+    }
+
+    variable "region" {
+      description = "GCP region for all resources"
+      type        = string
+      default     = "us-central1"
+    }
+
+    variable "db_tier" {
+      description = "Cloud SQL machine tier"
+      type        = string
+      default     = "db-custom-2-4096"
+    }
+
+    variable "db_password" {
+      description = "Cloud SQL fraud_user password"
+      type        = string
+      sensitive   = true
+    }
+    ```
+
+C. main.tf — Full GCP Infrastructure
+
+    ```hcl
+    terraform {
+      required_providers {
+        google = {
+          source  = "hashicorp/google"
+          version = "~> 6.0"
+        }
+      }
+    }
+
+    provider "google" {
+      project = var.project_id
+      region  = var.region
+    }
+
+    # ── Artifact Registry (Docker image storage) ─────────────────────────
+    resource "google_artifact_registry_repository" "claims_images" {
+      location      = var.region
+      repository_id = "claims-images"
+      format        = "DOCKER"
+    }
+
+    # ── GCS (Photo storage) ──────────────────────────────────────────────
+    resource "google_storage_bucket" "photos" {
+      name                        = "${var.project_id}-claim-photos"
+      location                    = "US"
+      uniform_bucket_level_access = true
+      versioning { enabled = true }
+
+      lifecycle_rule {
+        action { type = "SetStorageClass"; storage_class = "NEARLINE" }
+        condition { age = 90 }
+      }
+    }
+
+    # ── Cloud SQL Postgres 17 ────────────────────────────────────────────
+    resource "google_sql_database_instance" "fraud_db" {
+      name             = "fraud-detection-db"
+      database_version = "POSTGRES_17"
+      region           = var.region
+
+      settings {
+        tier              = var.db_tier
+        availability_type = "REGIONAL"
+
+        ip_configuration {
+          ipv4_enabled = false
+          private_network = google_compute_network.vpc.id
+        }
+
+        backup_configuration {
+          enabled                        = true
+          point_in_time_recovery_enabled = true
+        }
+      }
+
+      deletion_protection = true
+    }
+
+    resource "google_sql_database" "fraud_detection" {
+      name     = "fraud_detection"
+      instance = google_sql_database_instance.fraud_db.name
+    }
+
+    resource "google_sql_user" "fraud_user" {
+      name     = "fraud_user"
+      instance = google_sql_database_instance.fraud_db.name
+      password = var.db_password
+    }
+
+    # ── VPC (private networking for Cloud SQL) ───────────────────────────
+    resource "google_compute_network" "vpc" {
+      name                    = "claims-vpc"
+      auto_create_subnetworks = true
+    }
+
+    resource "google_compute_global_address" "private_ip" {
+      name          = "claims-sql-ip"
+      purpose       = "VPC_PEERING"
+      address_type  = "INTERNAL"
+      prefix_length = 16
+      network       = google_compute_network.vpc.id
+    }
+
+    resource "google_service_networking_connection" "private_vpc" {
+      network                 = google_compute_network.vpc.id
+      service                 = "servicenetworking.googleapis.com"
+      reserved_peering_ranges = [google_compute_global_address.private_ip.name]
+    }
+
+    # ── Pub/Sub (GCS upload events) ──────────────────────────────────────
+    resource "google_pubsub_topic" "photo_uploads" {
+      name = "photo-uploads"
+    }
+
+    resource "google_pubsub_subscription" "worker_sub" {
+      name  = "worker-photo-sub"
+      topic = google_pubsub_topic.photo_uploads.id
+
+      # Push endpoint is set after first deploy via:
+      #   gcloud pubsub subscriptions update worker-photo-sub \
+      #     --push-endpoint="${WORKER_URL}/webhook/photo-uploaded" \
+      #     --push-auth-service-account=claims-worker@${PROJECT_ID}.iam.gserviceaccount.com
+      # See deploy.sh (Section 17B) — it wires the subscription on first run.
+
+      ack_deadline_seconds = 300
+    }
+
+    resource "google_storage_notification" "photo_notification" {
+      bucket         = google_storage_bucket.photos.name
+      payload_format = "JSON_API_V1"
+      topic          = google_pubsub_topic.photo_uploads.id
+      event_types    = ["OBJECT_FINALIZE"]
+    }
+
+    # ── Secret Manager ───────────────────────────────────────────────────
+    resource "google_secret_manager_secret" "gemini_api_key" {
+      secret_id = "gemini-api-key"
+      replication { auto {} }
+    }
+
+    resource "google_secret_manager_secret" "session_secret" {
+      secret_id = "session-secret"
+      replication { auto {} }
+    }
+
+    resource "google_secret_manager_secret" "exchange_password" {
+      secret_id = "exchange-password"
+      replication { auto {} }
+    }
+
+    # ── Service Accounts ─────────────────────────────────────────────────
+    resource "google_service_account" "api" {
+      account_id   = "claims-api"
+      display_name = "Claims API Service"
+    }
+
+    resource "google_service_account" "worker" {
+      account_id   = "claims-worker"
+      display_name = "Claims Worker Service"
+    }
+
+    # ── IAM Bindings ─────────────────────────────────────────────────────
+    # API: read/write GCS, connect Cloud SQL, read secrets
+    resource "google_project_iam_member" "api_storage" {
+      project = var.project_id
+      role    = "roles/storage.objectAdmin"
+      member  = "serviceAccount:${google_service_account.api.email}"
+    }
+
+    resource "google_project_iam_member" "api_sql" {
+      project = var.project_id
+      role    = "roles/cloudsql.client"
+      member  = "serviceAccount:${google_service_account.api.email}"
+    }
+
+    resource "google_project_iam_member" "api_secrets" {
+      project = var.project_id
+      role    = "roles/secretmanager.secretAccessor"
+      member  = "serviceAccount:${google_service_account.api.email}"
+    }
+
+    # Worker: read GCS, connect Cloud SQL, read secrets, use Vision API
+    resource "google_project_iam_member" "worker_storage" {
+      project = var.project_id
+      role    = "roles/storage.objectViewer"
+      member  = "serviceAccount:${google_service_account.worker.email}"
+    }
+
+    resource "google_project_iam_member" "worker_sql" {
+      project = var.project_id
+      role    = "roles/cloudsql.client"
+      member  = "serviceAccount:${google_service_account.worker.email}"
+    }
+
+    resource "google_project_iam_member" "worker_secrets" {
+      project = var.project_id
+      role    = "roles/secretmanager.secretAccessor"
+      member  = "serviceAccount:${google_service_account.worker.email}"
+    }
+
+    # ── Cloud Run services are NOT managed by Terraform ────────────────
+    # Cloud Run deployments are handled by deploy.sh (Section 17B).
+    # Terraform creates the infrastructure that Cloud Run services use:
+    #   - Artifact Registry, GCS, Cloud SQL, Pub/Sub, Secret Manager,
+    #     VPC, IAM service accounts + bindings, API enablement.
+    # deploy.sh creates/updates the actual Cloud Run services because
+    # they change frequently (new image on every deploy) and Terraform
+    # would create state drift on every gcloud run deploy.
+
+    # ── VPC Connector (Cloud Run → Cloud SQL private access) ─────────────
+    resource "google_vpc_access_connector" "connector" {
+      name          = "claims-vpc-connector"
+      region        = var.region
+      network       = google_compute_network.vpc.name
+      ip_cidr_range = "10.8.0.0/28"
+    }
+
+    # ── Enable Required APIs ─────────────────────────────────────────────
+    resource "google_project_service" "apis" {
+      for_each = toset([
+        "run.googleapis.com",
+        "sqladmin.googleapis.com",
+        "secretmanager.googleapis.com",
+        "artifactregistry.googleapis.com",
+        "vision.googleapis.com",
+        "pubsub.googleapis.com",
+        "vpcaccess.googleapis.com",
+        "servicenetworking.googleapis.com",
+        "cloudbuild.googleapis.com",
+      ])
+      service            = each.value
+      disable_on_destroy = false
+    }
+    ```
+
+D. outputs.tf
+
+    ```hcl
+    output "photos_bucket" {
+      value = google_storage_bucket.photos.name
+    }
+
+    output "db_connection_name" {
+      value = google_sql_database_instance.fraud_db.connection_name
+    }
+
+    output "artifact_registry_repo" {
+      value = google_artifact_registry_repository.claims_images.id
+    }
+
+    output "vpc_connector_name" {
+      value = google_vpc_access_connector.connector.name
+    }
+
+    output "api_service_account" {
+      value = google_service_account.api.email
+    }
+
+    output "worker_service_account" {
+      value = google_service_account.worker.email
+    }
+    ```
+
+E. IAM / Permissions Summary
+
+    | Service Account | Roles                                              |
+    |-----------------|-----------------------------------------------------|
+    | claims-api      | storage.objectAdmin, cloudsql.client, secretmanager.secretAccessor |
+    | claims-worker   | storage.objectViewer, cloudsql.client, secretmanager.secretAccessor |
+
+    Project-level APIs that must be enabled:
+    - Cloud Run, Cloud SQL Admin, Secret Manager, Artifact Registry
+    - Cloud Vision, Pub/Sub, VPC Access, Service Networking, Cloud Build
+
+
+================================================================================
+SECTION 11 — BATCH PROCESSING STRATEGY
+================================================================================
+For bulk back-testing across the full photo corpus (hundreds of thousands of
+existing photos) or nightly re-analysis runs.
+
+A. Queue-Based Batch Processing
+
+    Architecture:
+      Postgres "batch_jobs" table acts as a simple job queue.
+      Worker processes pull unprocessed claims and run the full pipeline.
+
+    ```sql
+    CREATE TABLE batch_jobs (
+        id              SERIAL PRIMARY KEY,
+        contract_id     VARCHAR(100) NOT NULL,
+        claim_id        VARCHAR(100) NOT NULL,
+        status          VARCHAR(20) DEFAULT 'pending',  -- pending, processing, completed, failed
+        worker_id       VARCHAR(50),
+        started_at      TIMESTAMPTZ,
+        completed_at    TIMESTAMPTZ,
+        error_message   TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- Populate batch queue from existing claims
+    INSERT INTO batch_jobs (contract_id, claim_id)
+    SELECT DISTINCT contract_id, claim_id
+    FROM claims
+    WHERE gemini_analysis IS NULL;
+    ```
+
+B. Batch Worker Logic
+
+    ```python
+    import time
+
+    def run_batch_worker(worker_id: str, db_session, config):
+        """Pull and process claims from the batch queue."""
+        while True:
+            # Atomically claim next job
+            job = db_session.execute("""
+                UPDATE batch_jobs
+                SET status = 'processing', worker_id = %s, started_at = NOW()
+                WHERE id = (
+                    SELECT id FROM batch_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, contract_id, claim_id
+            """, [worker_id]).fetchone()
+
+            if not job:
+                time.sleep(5)  # No work available, wait
+                continue
+
+            try:
+                process_claim(job.contract_id, job.claim_id, config)
+                db_session.execute("""
+                    UPDATE batch_jobs
+                    SET status = 'completed', completed_at = NOW()
+                    WHERE id = %s
+                """, [job.id])
+            except Exception as e:
+                db_session.execute("""
+                    UPDATE batch_jobs
+                    SET status = 'failed', error_message = %s, completed_at = NOW()
+                    WHERE id = %s
+                """, [str(e), job.id])
+            db_session.commit()
+    ```
+
+C. Vertex AI Batch Inference (GCP-Native Alternative)
+
+    For maximum throughput on GCP, use Vertex AI's native batch system:
+
+    1. Generate JSONL request file (one line per photo/claim):
+       ```json
+       {"request":{"contents":[{"role":"user","parts":[{"text":"Analyze..."},{"inline_data":{"mime_type":"image/jpeg","data":"base64..."}}]}]}}
+       ```
+
+    2. Upload JSONL to GCS:
+       gs://YOUR_BATCH_INPUT/batch_job_2026_03_24.jsonl
+
+    3. Submit batch job via API or gcloud:
+       ```bash
+       gcloud ai batch-predictions create \
+         --model=gemini-2.5-flash \
+         --input-uri=gs://YOUR_BATCH_INPUT/batch_job.jsonl \
+         --output-uri=gs://YOUR_BATCH_OUTPUT/results/
+       ```
+
+    4. Results land in GCS as JSONL → parse and load into Postgres.
+
+    Benefits: ~50% cheaper, handles 200K+ per job, ~24hr turnaround.
+
+D. Scaling Guidelines
+
+    | Volume              | Recommended Approach               | Workers | Est. Time   |
+    |---------------------|------------------------------------|---------|-------------|
+    | < 1,000 photos      | Single worker, real-time           | 1       | Minutes     |
+    | 1K – 50K photos     | Queue-based, 3–5 workers           | 3-5     | Hours       |
+    | 50K – 200K photos   | Queue-based, 10+ workers OR batch  | 10+     | Hours–1 day |
+    | 200K+ photos        | Vertex AI Batch Inference           | N/A     | ~24 hours   |
+
+
+================================================================================
+SECTION 12 — GCP DEPLOYMENT
+================================================================================
+All services deploy to GCP Cloud Run. Images are built with Cloud Build,
+stored in Artifact Registry, and deployed via deploy.sh (Section 17B).
+
+A. Service Deployment Summary
+
+    | Cloud Run Service    | Image Source            | Trigger                          |
+    |----------------------|-------------------------|----------------------------------|
+    | claims-api           | Artifact Registry       | HTTPS requests (dashboard, portal)|
+    | claims-worker        | Artifact Registry       | Pub/Sub push (GCS upload events) |
+    | claims-dashboard     | Artifact Registry       | HTTPS requests (user browser)    |
+
+    Supporting managed services:
+    | GCP Service          | Purpose                          |
+    |----------------------|----------------------------------|
+    | Cloud SQL Postgres 17| Persistent database              |
+    | GCS                  | Photo storage                    |
+    | Pub/Sub              | Event bus (GCS → worker)         |
+    | Secret Manager       | All secrets + API keys           |
+    | Artifact Registry    | Docker image storage             |
+    | Cloud Build          | CI/CD image builds               |
+
+B. Deploy All Services
+
+    Per the script-first mandate (Section 1B), all deployments run through
+    deploy.sh (Section 17B). Never run gcloud run deploy by hand.
+
+    ```bash
+    # First-time full deployment
+    ./scripts/provision.sh    # Creates infra via Terraform (Section 17A)
+    ./scripts/deploy.sh --all # Builds images + deploys to Cloud Run (Section 17B)
+
+    # Subsequent deploys (e.g., after code changes)
+    ./scripts/deploy.sh --all       # Rebuild + redeploy everything
+    ./scripts/deploy.sh api         # Rebuild + redeploy only the API
+    ./scripts/deploy.sh worker      # Rebuild + redeploy only the worker
+    ./scripts/deploy.sh dashboard   # Rebuild + redeploy only the dashboard
+    ```
+
+    The Pub/Sub subscription (GCS → worker) is created by Terraform
+    during provisioning (Section 10). It does not need to be recreated
+    on subsequent deploys.
+
+C. Go-Live Checklist
+
+    Phase 1 — GCP Smoke Test:
+      [ ] provision.sh completes (Terraform creates all infra)
+      [ ] deploy.sh --all completes (all 3 Cloud Run services deployed)
+      [ ] health_check.sh passes all checks
+      [ ] Upload 10 test photos to GCS bucket → verify Pub/Sub delivers to worker
+      [ ] Verify EXIF extraction + Gemini analysis results in Cloud SQL
+      [ ] Verify Cloud Vision returns reverse image results
+      [ ] Dashboard loads at Cloud Run URL, shows processed claims
+
+    Phase 2 — Pilot (1,000–5,000 photos):
+      [ ] Load pilot batch of real claim photos to GCS
+      [ ] Worker processes all photos without errors
+      [ ] Claims team reviews dashboard output
+      [ ] Tune risk_score thresholds based on results
+      [ ] Validate cost projections match actuals
+      [ ] Confirm email alerts fire for high-risk claims
+
+    Phase 3 — Production Scale:
+      [ ] Load full historical photo corpus (batch upload to GCS)
+      [ ] Enable real-time processing for new claims
+      [ ] Set up Cloud Monitoring alerts for errors + latency
+      [ ] Configure log-based metrics in Cloud Logging
+      [ ] Run golden dataset validation (Section 19)
+      [ ] Document operational runbook for claims team
+      [ ] Schedule periodic re-analysis runs (weekly with updated models)
+
+D. Cost Summary
+
+    | Component               | Est. Monthly Cost (100K photos) |
+    |-------------------------|---------------------------------|
+    | Gemini Flash (batch)    | $1,000 – $3,000                 |
+    | Cloud Vision Web Detect | $150 – $200                     |
+    | Cloud Run (3 services)  | $50 – $200                      |
+    | Cloud SQL Postgres      | $50 – $150                      |
+    | GCS                     | $20 – $50                       |
+    | Secret Manager          | $1 – $5                         |
+    | Artifact Registry       | $5 – $15                        |
+    | Pub/Sub                 | $5 – $10                        |
+    | TOTAL                   | ~$1,300 – $3,650/month          |
+
+    Compare to: Avantia's £1.2M annual fraud savings from the same approach.
+
+
+================================================================================
+SECTION 13 — PROMPT MANAGEMENT
+================================================================================
+All system prompts (Gemini instructions, analysis templates, Q&A prompts) are
+stored in Postgres and managed via CRUD endpoints. This avoids hardcoding
+prompts and lets the team iterate on prompt wording without redeploying code.
+
+A. Prompts Table
+
+    ```sql
+    CREATE TABLE system_prompts (
+        id              SERIAL PRIMARY KEY,
+        slug            VARCHAR(100) UNIQUE NOT NULL,  -- machine-readable key
+        name            VARCHAR(255) NOT NULL,         -- human-readable label
+        category        VARCHAR(50) NOT NULL,          -- 'system_instruction', 'analysis', 'qa'
+        content         TEXT NOT NULL,                 -- the actual prompt text
+        model           VARCHAR(50) DEFAULT 'gemini-2.5-flash',
+        is_active       BOOLEAN DEFAULT true,
+        version         INTEGER DEFAULT 1,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_by      VARCHAR(100)
+    );
+
+    CREATE INDEX idx_prompts_slug ON system_prompts(slug) WHERE is_active = true;
+    ```
+
+B. Default Prompts (seeded on first deploy)
+
+    | slug                        | category           | Purpose                                     |
+    |-----------------------------|--------------------|---------------------------------------------|
+    | fraud_system_instruction    | system_instruction | Senior fraud investigator persona (Sec 6A)  |
+    | fraud_analysis_template     | analysis           | Per-claim analysis prompt (Sec 6B)          |
+    | photo_qa_system             | system_instruction | Q&A persona for photo questions             |
+    | photo_qa_template           | qa                 | Template for ad-hoc photo questions          |
+    | high_risk_email_template    | notification       | Email body for high-risk alerts             |
+    | batch_analysis_template     | analysis           | Batch processing variant of analysis prompt |
+
+C. CRUD Endpoints (in api/routes/prompts.py)
+
+    GET    /api/prompts              — List all prompts (filterable by category)
+    GET    /api/prompts/{slug}       — Get a single prompt by slug
+    POST   /api/prompts              — Create a new prompt
+    PUT    /api/prompts/{slug}       — Update prompt content (auto-increments version)
+    DELETE /api/prompts/{slug}       — Soft-delete (set is_active = false)
+
+    Example request body (POST/PUT):
+    ```json
+    {
+      "slug": "fraud_analysis_template",
+      "name": "Fraud Analysis - Main Template",
+      "category": "analysis",
+      "content": "Analyze these photos for fraud indicators...",
+      "model": "gemini-2.5-flash"
+    }
+    ```
+
+D. How the Worker Uses Prompts
+
+    ```python
+    def get_active_prompt(db_session, slug: str) -> str:
+        """Fetch the active prompt by slug from the database."""
+        result = db_session.execute(
+            "SELECT content FROM system_prompts WHERE slug = %s AND is_active = true",
+            [slug]
+        ).fetchone()
+        if not result:
+            raise ValueError(f"No active prompt found for slug: {slug}")
+        return result.content
+    ```
+
+    The worker calls get_active_prompt("fraud_analysis_template") before each
+    Gemini call, so prompt changes take effect immediately without redeploy.
+
+E. Version History
+
+    Each PUT auto-increments the version field and updates updated_at.
+    For full audit trail, add a prompt_history table:
+
+    ```sql
+    CREATE TABLE prompt_history (
+        id          SERIAL PRIMARY KEY,
+        prompt_id   INTEGER REFERENCES system_prompts(id),
+        version     INTEGER NOT NULL,
+        content     TEXT NOT NULL,
+        changed_by  VARCHAR(100),
+        changed_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+    ```
+
+
+================================================================================
+SECTION 14 — API ENDPOINTS & SERVICE ARCHITECTURE
+================================================================================
+The FastAPI api service serves all user-facing endpoints. The worker handles
+async processing. Both share the same Cloud SQL Postgres database. The API
+returns fast responses; heavy work is queued for the worker.
+
+A. API / Worker Responsibility Split
+
+    | Responsibility              | Handled By | Why                                  |
+    |-----------------------------|------------|--------------------------------------|
+    | Photo upload + GCS write    | api        | Fast response to user                |
+    | Queue job for processing    | api        | Just an INSERT, instant              |
+    | EXIF extraction             | worker     | CPU work, async                      |
+    | Cloud Vision lookup         | worker     | External API, 1-5s                   |
+    | Gemini analysis             | worker     | External API, 10-30s                 |
+    | Fetch results / history     | api        | DB reads, fast                       |
+    | Photo Q&A (ask about photo) | api        | Single Gemini call, ~5s, inline OK   |
+    | Prompt CRUD                 | api        | DB reads/writes, fast                |
+    | Dashboard data              | api        | SQL views, fast                       |
+    | Email alerts                | worker     | Sent after processing completes      |
+
+B. Photo Endpoints (api/routes/photos.py)
+
+    POST   /api/photos/upload
+           — Accept multipart file upload
+           — Store in GCS: gs://{bucket}/{contract_id}/{claim_id}/{filename}
+           — Insert into processed_photos with status='pending'
+           — GCS upload automatically triggers Pub/Sub → worker (Section 3)
+           — Return: { "status": "accepted", "storage_key": "..." }
+
+    GET    /api/photos/{contract_id}/{claim_id}
+           — List all photos for a claim
+           — Return: array of { storage_key, presigned_url, extracted_metadata }
+
+    GET    /api/photos/{storage_key}/status
+           — Check processing status of a specific photo
+           — Return: { "status": "completed|pending|failed", "results": {...} }
+
+    POST   /api/photos/{storage_key}/ask
+           — Submit a natural-language question about a specific photo
+           — Fetches photo bytes + existing analysis from DB
+           — Sends question + photo + context to Gemini (inline, not queued)
+           — Return: { "answer": "The tire visible is a Goodyear Eagle...", "model": "gemini-2.5-flash" }
+
+C. Claims Endpoints (api/routes/claims.py)
+
+    GET    /api/claims
+           — Paginated list from claims_dashboard view
+           — Query params: ?risk_min=70&tire_changed=true&page=1&per_page=50
+
+    GET    /api/claims/{contract_id}
+           — Full contract history from contract_history view
+
+    GET    /api/claims/{contract_id}/{claim_id}
+           — Single claim detail with full Gemini analysis JSON
+
+D. Dashboard Endpoints (api/routes/dashboard.py)
+
+    GET    /api/dashboard/summary
+           — Today's fraud summary from daily_fraud_summary view
+
+    GET    /api/dashboard/high-risk
+           — All claims with risk_score >= 70, paginated
+
+    GET    /api/dashboard/stats
+           — Aggregate stats: total processed, avg risk, web match count
+
+E. Auth Endpoints (api/routes/auth.py) — POC Phase
+
+    POST   /api/auth/login
+           — Body: { "username": "...", "password": "..." }
+           — Validates against users table (bcrypt hashed passwords)
+           — Returns JWT token with expiry (SESSION_TIMEOUT_MINUTES)
+           — Return: { "token": "eyJ...", "expires_in": 3600 }
+
+    GET    /api/auth/me
+           — Requires valid token in Authorization header
+           — Returns current user info
+
+    POST   /api/auth/logout
+           — Invalidates token (adds to blacklist or relies on expiry)
+
+F. Health Endpoint
+
+    GET    /api/health
+           — Returns { "status": "ok", "db": "connected", "storage": "connected" }
+           — Used by health_check.sh script and load balancers
+
+
+================================================================================
+SECTION 15 — REACT SPA DASHBOARD
+================================================================================
+The claims team dashboard is a React single-page application served by nginx.
+It calls the FastAPI endpoints (Section 14) via a JS API client. No server-side
+rendering — pure client-side React with TypeScript.
+
+A. Tech Stack
+
+    | Library          | Purpose                          |
+    |------------------|----------------------------------|
+    | React 18+        | UI framework                     |
+    | TypeScript       | Type safety                      |
+    | React Router     | Client-side routing              |
+    | TanStack Query   | Data fetching + caching          |
+    | Tailwind CSS     | Styling (or MUI if preferred)    |
+    | Vite             | Build tool                       |
+    | Axios            | HTTP client (via api/client.ts)  |
+
+B. Pages
+
+    | Route                        | Component             | Data Source (API)                   |
+    |------------------------------|-----------------------|-------------------------------------|
+    | /login                       | Login.tsx             | POST /api/auth/login                |
+    | /                            | Dashboard.tsx         | GET /api/dashboard/summary + stats  |
+    | /claims                      | ClaimsList.tsx        | GET /api/claims?...                 |
+    | /claims/:contractId          | ContractHistory.tsx   | GET /api/claims/{contractId}        |
+    | /claims/:contractId/:claimId | ClaimDetail.tsx       | GET /api/claims/{cId}/{clId}        |
+    | /photos/:storageKey/ask      | PhotoQA.tsx           | POST /api/photos/{key}/ask          |
+    | /prompts                     | PromptsManager.tsx    | GET/POST/PUT /api/prompts           |
+
+C. JS API Client (dashboard/src/api/client.ts)
+
+    ```typescript
+    import axios from 'axios';
+
+    const api = axios.create({
+      baseURL: '/api',
+    });
+
+    // Attach JWT token to every request
+    api.interceptors.request.use((config) => {
+      const token = sessionStorage.getItem('token');
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    });
+
+    // Auto-redirect to login on 401
+    api.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error.response?.status === 401) {
+          sessionStorage.removeItem('token');
+          window.location.href = '/login';
+        }
+        return Promise.reject(error);
+      }
+    );
+
+    export default api;
+    ```
+
+D. Session Management (client-side)
+
+    - On login success: store JWT in sessionStorage (not localStorage — cleared on tab close)
+    - On every API call: attach token via interceptor (Section 15C)
+    - On 401 response: clear token, redirect to /login
+    - Idle timeout: JS timer checks SESSION_TIMEOUT_MINUTES, auto-logouts
+    - No full user management system in POC — just seeded users (Section 18)
+
+    ```typescript
+    // Idle timeout (in App.tsx or a hook)
+    const TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes default
+    let idleTimer: ReturnType<typeof setTimeout>;
+
+    function resetIdleTimer() {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        sessionStorage.removeItem('token');
+        window.location.href = '/login';
+      }, TIMEOUT_MS);
+    }
+
+    // Reset on user activity
+    ['mousemove', 'keydown', 'click', 'scroll'].forEach(event =>
+      document.addEventListener(event, resetIdleTimer)
+    );
+    ```
+
+E. nginx Config
+
+    The full nginx.conf is defined in Section 9F. It handles:
+    - SPA fallback (try_files → /index.html) for React Router
+    - /api/* proxy to the API Cloud Run service
+    - /external/* proxy to the API Cloud Run service (future)
+
+
+================================================================================
+SECTION 16 — EXTERNAL PORTAL ENDPOINTS (FUTURE)
+================================================================================
+After the core system is validated, external endpoints will allow the claims
+portal to submit new photos and receive results programmatically. These
+endpoints require hardened security: API key auth, rate limiting, IP allowlists,
+request logging, and structured error responses.
+
+A. External Endpoint Spec
+
+    POST   /external/v1/claims/{contract_id}/{claim_id}/photos
+           — Upload photo(s) from external portal
+           — Auth: API key in X-API-Key header
+           — Rate limited: configurable per API key
+           — Returns: { "job_id": 123, "status": "accepted" }
+
+    GET    /external/v1/claims/{contract_id}/{claim_id}/results
+           — Fetch processing results for a claim
+           — Auth: API key in X-API-Key header
+           — Returns: full Gemini analysis JSON + risk score + red flags
+
+    GET    /external/v1/claims/{contract_id}/{claim_id}/status
+           — Check processing status (pending/completed/failed)
+           — Auth: API key in X-API-Key header
+
+B. Security Layer
+
+    ```python
+    # api/routes/external.py — middleware sketch
+    from fastapi import Header, HTTPException, Request
+    from datetime import datetime
+
+    async def verify_api_key(
+        request: Request,
+        x_api_key: str = Header(...),
+        db=Depends(get_db),
+    ):
+        """Validate API key, check rate limit, log request."""
+        key_record = db.execute(
+            "SELECT * FROM api_keys WHERE key_hash = %s AND is_active = true",
+            [hash_key(x_api_key)]
+        ).fetchone()
+
+        if not key_record:
+            log_blocked_request(request, reason="invalid_key")
+            raise HTTPException(status_code=403, detail="Invalid API key")
+
+        # IP allowlist check
+        client_ip = request.client.host
+        if key_record.allowed_ips and client_ip not in key_record.allowed_ips:
+            log_blocked_request(request, reason="ip_blocked", ip=client_ip)
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
+        # Rate limit check
+        recent_count = db.execute(
+            "SELECT COUNT(*) FROM api_request_log WHERE api_key_id = %s AND created_at > NOW() - INTERVAL '1 minute'",
+            [key_record.id]
+        ).scalar()
+
+        if recent_count >= key_record.rate_limit_per_minute:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        return key_record
+    ```
+
+C. Supporting Tables
+
+    ```sql
+    CREATE TABLE api_keys (
+        id                      SERIAL PRIMARY KEY,
+        name                    VARCHAR(255) NOT NULL,       -- "Claims Portal Prod"
+        key_hash                VARCHAR(255) UNIQUE NOT NULL, -- bcrypt hash of actual key
+        allowed_ips             TEXT[],                       -- IP allowlist (null = any)
+        rate_limit_per_minute   INTEGER DEFAULT 60,
+        is_active               BOOLEAN DEFAULT true,
+        created_at              TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE api_request_log (
+        id          SERIAL PRIMARY KEY,
+        api_key_id  INTEGER REFERENCES api_keys(id),
+        endpoint    TEXT NOT NULL,
+        method      VARCHAR(10),
+        client_ip   VARCHAR(45),
+        status_code INTEGER,
+        response_ms INTEGER,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX idx_api_log_key_time ON api_request_log(api_key_id, created_at DESC);
+    ```
+
+D. Response Format (always JSON, always consistent)
+
+    Success:
+    ```json
+    {
+      "status": "success",
+      "data": { ... },
+      "meta": { "request_id": "uuid", "timestamp": "ISO8601" }
+    }
+    ```
+
+    Error:
+    ```json
+    {
+      "status": "error",
+      "error": { "code": "RATE_LIMIT_EXCEEDED", "message": "..." },
+      "meta": { "request_id": "uuid", "timestamp": "ISO8601" }
+    }
+    ```
+
+
+================================================================================
+SECTION 17 — OPERATIONS SCRIPTS
+================================================================================
+Shell and Python scripts for provisioning, deployment, health checks, and
+testing. All scripts live in the scripts/ directory and operate against GCP.
+
+A. provision.sh — GCP Infrastructure Provisioning
+
+    Creates the GCP project resources, pushes secrets to Secret Manager,
+    and runs Terraform to stand up all infrastructure.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    PROJECT_ID=$(gcloud config get-value project)
+    REGION="${GCP_REGION:-us-central1}"
+
+    echo "=== Provisioning GCP Project: $PROJECT_ID ==="
+
+    # Enable required APIs
+    gcloud services enable \
+      run.googleapis.com \
+      sqladmin.googleapis.com \
+      storage.googleapis.com \
+      vision.googleapis.com \
+      secretmanager.googleapis.com \
+      artifactregistry.googleapis.com \
+      pubsub.googleapis.com \
+      vpcaccess.googleapis.com \
+      servicenetworking.googleapis.com \
+      cloudbuild.googleapis.com \
+      --project="$PROJECT_ID"
+
+    # Create Artifact Registry repo (if not exists)
+    gcloud artifacts repositories describe claims-images \
+      --location="$REGION" --project="$PROJECT_ID" 2>/dev/null || \
+    gcloud artifacts repositories create claims-images \
+      --repository-format=docker \
+      --location="$REGION" \
+      --project="$PROJECT_ID"
+
+    # Push secrets to Secret Manager (reads from stdin or prompts)
+    declare -a SECRETS=("gemini-api-key" "db-password" "session-secret" "exchange-password")
+    for secret_name in "${SECRETS[@]}"; do
+      if ! gcloud secrets describe "$secret_name" --project="$PROJECT_ID" &>/dev/null; then
+        echo "  Creating secret: $secret_name"
+        echo -n "  Enter value for $secret_name: "
+        read -rs value
+        echo
+        echo -n "$value" | gcloud secrets create "$secret_name" \
+          --data-file=- --project="$PROJECT_ID"
+      else
+        echo "  Secret $secret_name already exists (use 'gcloud secrets versions add' to update)"
+      fi
+    done
+
+    # Run Terraform
+    echo "=== Running Terraform ==="
+    cd terraform
+    terraform init
+    terraform plan -var="project_id=$PROJECT_ID"
+    echo ""
+    read -p "Apply? (y/N): " confirm
+    [[ "$confirm" == "y" ]] && terraform apply -var="project_id=$PROJECT_ID"
+
+    echo "=== Provisioning complete ==="
+    ```
+
+B. deploy.sh — Build, Push, and Deploy to Cloud Run
+
+    Builds Docker images via Cloud Build, pushes to Artifact Registry,
+    and deploys to Cloud Run. Supports selective service deployment.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    PROJECT_ID=$(gcloud config get-value project)
+    REGION="${GCP_REGION:-us-central1}"
+    REPO="${REGION}-docker.pkg.dev/${PROJECT_ID}/claims-images"
+    ALL_SERVICES=("api" "worker" "dashboard")
+    TARGETS=()
+
+    usage() {
+      echo "Usage: ./deploy.sh [--all | service1 service2 ...]"
+      echo "  --all       Build and deploy all services"
+      echo "  service     One or more of: ${ALL_SERVICES[*]}"
+      exit 1
+    }
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --all)      TARGETS=("${ALL_SERVICES[@]}"); shift ;;
+        --help|-h)  usage ;;
+        *)          TARGETS+=("$1"); shift ;;
+      esac
+    done
+
+    [[ ${#TARGETS[@]} -eq 0 ]] && usage
+
+    for svc in "${TARGETS[@]}"; do
+      echo ""
+      echo "=== Building ${svc} ==="
+      gcloud builds submit "./${svc}" --tag="${REPO}/${svc}:latest"
+
+      echo "=== Deploying ${svc} to Cloud Run ==="
+      case "$svc" in
+        api)
+          gcloud run deploy claims-api \
+            --image="${REPO}/api:latest" \
+            --region="${REGION}" \
+            --memory=512Mi --cpu=1 \
+            --set-env-vars="GCS_BUCKET=${PROJECT_ID}-claim-photos,GEMINI_MODEL=gemini-2.5-flash,CLOUD_SQL_CONNECTION_NAME=${PROJECT_ID}:${REGION}:fraud-detection-db" \
+            --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,DB_PASSWORD=db-password:latest,SESSION_SECRET=session-secret:latest" \
+            --service-account="claims-api@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --vpc-connector=claims-vpc-connector \
+            --no-allow-unauthenticated
+          ;;
+        worker)
+          gcloud run deploy claims-worker \
+            --image="${REPO}/worker:latest" \
+            --region="${REGION}" \
+            --memory=1Gi --cpu=2 \
+            --set-env-vars="GCS_BUCKET=${PROJECT_ID}-claim-photos,GEMINI_MODEL=gemini-2.5-flash,ENABLE_CLOUD_VISION=true,CLOUD_SQL_CONNECTION_NAME=${PROJECT_ID}:${REGION}:fraud-detection-db" \
+            --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,DB_PASSWORD=db-password:latest,EXCHANGE_PASSWORD=exchange-password:latest" \
+            --service-account="claims-worker@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --vpc-connector=claims-vpc-connector \
+            --no-allow-unauthenticated
+
+          # Wire Pub/Sub push subscription to worker endpoint
+          WORKER_URL=$(gcloud run services describe claims-worker --region="${REGION}" --format='value(status.url)')
+          gcloud pubsub subscriptions update worker-photo-sub \
+            --push-endpoint="${WORKER_URL}/webhook/photo-uploaded" \
+            --push-auth-service-account="claims-worker@${PROJECT_ID}.iam.gserviceaccount.com" \
+            2>/dev/null || \
+          echo "  Note: Pub/Sub subscription will be wired on next provision + deploy cycle"
+          ;;
+        dashboard)
+          API_URL=$(gcloud run services describe claims-api --region="${REGION}" --format='value(status.url)')
+          gcloud run deploy claims-dashboard \
+            --image="${REPO}/dashboard:latest" \
+            --region="${REGION}" \
+            --memory=256Mi --cpu=1 \
+            --set-env-vars="API_SERVICE_URL=${API_URL}" \
+            --allow-unauthenticated
+          ;;
+      esac
+    done
+
+    echo ""
+    echo "=== Deploy complete ==="
+    gcloud run services list --region="${REGION}" --format="table(SERVICE,URL,LAST_DEPLOYED)"
+    ```
+
+C. health_check.sh — Cloud Run Health Verification
+
+    Checks that all Cloud Run services are running and responding.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    PROJECT_ID=$(gcloud config get-value project)
+    REGION="${GCP_REGION:-us-central1}"
+    PASS=0
+    FAIL=0
+
+    check() {
+      local name="$1" cmd="$2"
+      if eval "$cmd" &>/dev/null; then
+        echo "  ✓ $name"
+        ((PASS++))
+      else
+        echo "  ✗ $name"
+        ((FAIL++))
+      fi
+    }
+
+    # Get Cloud Run URLs
+    API_URL=$(gcloud run services describe claims-api --region="$REGION" --format='value(status.url)' 2>/dev/null || echo "")
+    DASH_URL=$(gcloud run services describe claims-dashboard --region="$REGION" --format='value(status.url)' 2>/dev/null || echo "")
+    WORKER_URL=$(gcloud run services describe claims-worker --region="$REGION" --format='value(status.url)' 2>/dev/null || echo "")
+
+    # Get auth token for authenticated services
+    TOKEN=$(gcloud auth print-identity-token 2>/dev/null || echo "")
+
+    echo "=== Cloud Run Services ==="
+    check "API service exists"       "[[ -n '$API_URL' ]]"
+    check "Dashboard service exists"  "[[ -n '$DASH_URL' ]]"
+    check "Worker service exists"     "[[ -n '$WORKER_URL' ]]"
+
+    echo "Endpoints:"
+    check "API health"       "curl -sf -H 'Authorization: Bearer $TOKEN' '${API_URL}/api/health'"
+    check "Dashboard loads"  "curl -sf '${DASH_URL}/' | grep -q 'html'"
+    check "Worker health"    "curl -sf -H 'Authorization: Bearer $TOKEN' '${WORKER_URL}/health'"
+
+    echo "GCP Services:"
+    check "Cloud SQL instance running" \
+      "gcloud sql instances describe fraud-detection-db --format='value(state)' | grep -q 'RUNNABLE'"
+    check "GCS bucket exists" \
+      "gsutil ls gs://${PROJECT_ID}-claim-photos/ &>/dev/null"
+    check "Pub/Sub topic exists" \
+      "gcloud pubsub topics describe photo-uploads --project=$PROJECT_ID"
+    check "Pub/Sub subscription exists" \
+      "gcloud pubsub subscriptions describe worker-photo-sub --project=$PROJECT_ID"
+
+    echo "Database:"
+    check "Cloud SQL accepts connections" \
+      "gcloud sql connect fraud-detection-db --quiet --user=fraud_user --database=fraud_detection < /dev/null"
+
+    echo ""
+    echo "Results: $PASS passed, $FAIL failed"
+    [[ $FAIL -eq 0 ]] && exit 0 || exit 1
+    ```
+
+D. test_suite.py — Full Test Suite (runs against Cloud Run)
+
+    Comprehensive tests that validate actual processing on GCP.
+    Uses the golden dataset (Section 19) for validation.
+
+    ```python
+    # scripts/test_suite.py
+    import os
+    import requests
+    import time
+    import sys
+    import subprocess
+    import json
+
+    # Get API URL from Cloud Run
+    result = subprocess.run(
+        ["gcloud", "run", "services", "describe", "claims-api",
+         "--region=us-central1", "--format=value(status.url)"],
+        capture_output=True, text=True
+    )
+    BASE = result.stdout.strip()
+
+    # Get identity token for authenticated requests
+    token_result = subprocess.run(
+        ["gcloud", "auth", "print-identity-token"],
+        capture_output=True, text=True
+    )
+    GCP_TOKEN = token_result.stdout.strip()
+    SESSION_TOKEN = None
+
+    def gcp_headers():
+        """Headers for Cloud Run auth (service-level)."""
+        return {"Authorization": f"Bearer {GCP_TOKEN}"}
+
+    def app_headers():
+        """Headers for application auth (user-level)."""
+        h = gcp_headers()
+        if SESSION_TOKEN:
+            h["X-Session-Token"] = SESSION_TOKEN
+        return h
+
+    def login():
+        global SESSION_TOKEN
+        r = requests.post(f"{BASE}/api/auth/login",
+                          json={"username": "miles", "password": os.environ["MILES_PW"]},
+                          headers=gcp_headers())
+        assert r.status_code == 200, f"Login failed: {r.text}"
+        SESSION_TOKEN = r.json()["token"]
+
+    def test_health():
+        r = requests.get(f"{BASE}/api/health", headers=gcp_headers())
+        assert r.status_code == 200
+
+    def test_upload_photo():
+        with open("test_data/sample_claim_photo.jpg", "rb") as f:
+            r = requests.post(
+                f"{BASE}/api/photos/upload",
+                files={"file": f},
+                data={"contract_id": "TEST_001", "claim_id": "CLM_001"},
+                headers=app_headers()
+            )
+        assert r.status_code == 200
+        return r.json()["job_id"]
+
+    def test_wait_for_processing(job_id, timeout=120):
+        for _ in range(timeout // 5):
+            r = requests.get(f"{BASE}/api/photos/status/{job_id}",
+                             headers=app_headers())
+            if r.json()["status"] == "completed":
+                return r.json()
+            time.sleep(5)
+        raise TimeoutError("Processing did not complete")
+
+    def test_claims_dashboard():
+        r = requests.get(f"{BASE}/api/claims?risk_min=0", headers=app_headers())
+        assert r.status_code == 200
+        assert len(r.json()["data"]) > 0
+
+    def test_photo_qa():
+        r = requests.post(
+            f"{BASE}/api/photos/TEST_001/CLM_001/photo_001.jpg/ask",
+            json={"question": "What tire brand is visible?"},
+            headers=app_headers()
+        )
+        assert r.status_code == 200
+        assert "answer" in r.json()
+
+    if __name__ == "__main__":
+        print(f"Testing against: {BASE}")
+        test_health()
+        login()
+        job_id = test_upload_photo()
+        test_wait_for_processing(job_id)
+        test_claims_dashboard()
+        test_photo_qa()
+        print("All tests passed")
+    ```
+
+
+================================================================================
+SECTION 18 — SEEDER & POC AUTHENTICATION
+================================================================================
+For the proof of concept, there is no full user management system. Users are
+seeded directly into the database. Authentication is session-based with JWT
+tokens and a simple login page.
+
+A. Users Table
+
+    ```sql
+    CREATE TABLE users (
+        id              SERIAL PRIMARY KEY,
+        username        VARCHAR(100) UNIQUE NOT NULL,
+        password_hash   VARCHAR(255) NOT NULL,       -- bcrypt
+        display_name    VARCHAR(255),
+        role            VARCHAR(50) DEFAULT 'reviewer',  -- admin, reviewer
+        is_active       BOOLEAN DEFAULT true,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    ```
+
+B. Seed Script (scripts/seed.py)
+
+    Seeds users, default prompts, and test data for POC.
+
+    ```python
+    # scripts/seed.py
+    import os
+    from google.cloud.sql.connector import Connector
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+    from passlib.hash import bcrypt
+
+    INSTANCE = os.environ["CLOUD_SQL_CONNECTION_NAME"]  # PROJECT:REGION:INSTANCE
+    DB_USER = os.environ.get("DB_USER", "fraud_user")
+    DB_PASS = os.environ["DB_PASSWORD"]
+    DB_NAME = os.environ.get("DB_NAME", "fraud_detection")
+
+    connector = Connector(refresh_strategy="lazy")
+
+    def _getconn():
+        return connector.connect(INSTANCE, "pg8000", user=DB_USER, password=DB_PASS, db=DB_NAME)
+
+    engine = create_engine("postgresql+pg8000://", creator=_getconn)
+
+    def seed():
+        with Session(engine) as session:
+            # --- Seed Users (passwords MUST be set in env — no defaults) ---
+            users = [
+                ("miles", os.environ["MILES_PW"], "Miles", "admin"),
+                ("greg",  os.environ["GREG_PW"],  "Greg",  "admin"),
+            ]
+            for username, password, display_name, role in users:
+                pw_hash = bcrypt.hash(password)
+                session.execute(text("""
+                    INSERT INTO users (username, password_hash, display_name, role)
+                    VALUES (:u, :pw, :dn, :r)
+                    ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash
+                """), {"u": username, "pw": pw_hash, "dn": display_name, "r": role})
+
+            # --- Seed Default System Prompts ---
+            prompts = [
+                ("fraud_system_instruction", "System Instruction - Fraud Investigator", "system_instruction",
+                 "You are a senior insurance fraud investigator with 20 years of experience. "
+                 "Be extremely strict and factual. Never speculate without evidence. "
+                 "Always cite specific visual details to support your findings."),
+                ("fraud_analysis_template", "Fraud Analysis - Main Template", "analysis",
+                 "Analyze these photos for fraud indicators.\n\nCONTRACT: {contract_id}\n..."),
+                ("photo_qa_system", "Q&A System Instruction", "system_instruction",
+                 "You are an expert photo analyst for insurance claims. Answer questions "
+                 "about the provided photo accurately and concisely."),
+                ("photo_qa_template", "Photo Q&A Template", "qa",
+                 "Photo context:\n{existing_analysis}\n\nUser question: {question}"),
+                ("high_risk_email_template", "High Risk Alert Email", "notification",
+                 "ALERT: Claim {claim_id} (Contract {contract_id}) scored {risk_score}/100.\n"
+                 "Red flags: {red_flags}\nReview at: {dashboard_url}"),
+                ("batch_analysis_template", "Batch Analysis Template", "analysis",
+                 "Analyze these photos for fraud indicators (batch mode)..."),
+            ]
+            for slug, name, category, content in prompts:
+                session.execute(text("""
+                    INSERT INTO system_prompts (slug, name, category, content)
+                    VALUES (:s, :n, :c, :co)
+                    ON CONFLICT (slug) DO NOTHING
+                """), {"s": slug, "n": name, "c": category, "co": content})
+
+            # --- Seed Test Claim Data (for POC) ---
+            session.execute(text("""
+                INSERT INTO claims (contract_id, claim_id, claim_date, risk_score, red_flags, photo_uris)
+                VALUES
+                  ('TEST_CONTRACT_001', 'CLM_001', '2026-01-15', 82.5,
+                   ARRAY['Tire brand changed: Michelin → Goodyear', 'Timestamp mismatch: 5 days before loss'],
+                   ARRAY['photos/TEST_CONTRACT_001/CLM_001/front.jpg']),
+                  ('TEST_CONTRACT_001', 'CLM_002', '2026-03-01', 15.0,
+                   ARRAY[]::TEXT[],
+                   ARRAY['photos/TEST_CONTRACT_001/CLM_002/front.jpg']),
+                  ('TEST_CONTRACT_002', 'CLM_003', '2026-02-20', 91.0,
+                   ARRAY['Exact web match found', 'Photo GPS 200 miles from service drive'],
+                   ARRAY['photos/TEST_CONTRACT_002/CLM_003/damage.jpg'])
+                ON CONFLICT (contract_id, claim_id) DO NOTHING
+            """))
+
+            session.commit()
+        connector.close()
+        print("Seed complete: users, prompts, and test claims inserted.")
+
+    if __name__ == "__main__":
+        seed()
+    ```
+
+    Run locally (Cloud SQL connector handles the connection — no proxy needed):
+
+      # Set credentials in your local .env (never committed to git):
+      #   export CLOUD_SQL_CONNECTION_NAME="myproject:us-central1:fraud-detection-db"
+      #   export DB_PASSWORD="..."
+      #   export MILES_PW="..."
+      #   export GREG_PW="..."
+      source .env && python scripts/seed.py
+
+C. JWT Auth Flow (api/services/auth.py)
+
+    ```python
+    import os
+    from datetime import datetime, timedelta
+    from jose import jwt
+    from passlib.hash import bcrypt
+    from sqlalchemy import text
+
+    SECRET = os.getenv("SESSION_SECRET")
+    TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "60"))
+
+    def authenticate(db, username: str, password: str) -> dict | None:
+        user = db.execute(
+            text("SELECT * FROM users WHERE username = :u AND is_active = true"),
+            {"u": username}
+        ).fetchone()
+        if user and bcrypt.verify(password, user.password_hash):
+            token = jwt.encode(
+                {"sub": user.username, "role": user.role,
+                 "exp": datetime.utcnow() + timedelta(minutes=TIMEOUT)},
+                SECRET, algorithm="HS256"
+            )
+            return {"token": token, "expires_in": TIMEOUT * 60}
+        return None
+
+    def get_current_user(token: str) -> dict:
+        payload = jwt.decode(token, SECRET, algorithms=["HS256"])
+        return {"username": payload["sub"], "role": payload["role"]}
+    ```
+
+D. Login Page (dashboard/src/pages/Login.tsx) — Sketch
+
+    Simple form: username + password → POST /api/auth/login → store token in
+    sessionStorage → redirect to /. No registration, no password reset in POC.
+
+
+================================================================================
+SECTION 19 — PERFORMANCE MONITORING & GOLDEN DATASET
+================================================================================
+Track latency and throughput in the database. Maintain a golden dataset of
+known-result images for regression testing and nightly/pre-PR impact checks.
+
+A. Performance Metrics Table
+
+    ```sql
+    CREATE TABLE performance_metrics (
+        id              SERIAL PRIMARY KEY,
+        operation       VARCHAR(50) NOT NULL,   -- 'exif', 'vision', 'gemini', 'full_pipeline'
+        contract_id     VARCHAR(100),
+        claim_id        VARCHAR(100),
+        started_at      TIMESTAMPTZ NOT NULL,
+        completed_at    TIMESTAMPTZ NOT NULL,
+        duration_ms     INTEGER GENERATED ALWAYS AS
+                          (EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) STORED,
+        success         BOOLEAN DEFAULT true,
+        error_message   TEXT,
+        worker_id       VARCHAR(50),
+        model_used      VARCHAR(50),
+        photo_count     INTEGER,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX idx_perf_operation ON performance_metrics(operation, created_at DESC);
+    CREATE INDEX idx_perf_duration ON performance_metrics(operation, duration_ms DESC);
+    ```
+
+B. Recording Metrics in the Worker
+
+    ```python
+    from datetime import datetime
+
+    def record_metric(db, operation, contract_id, claim_id, started_at, success=True, error=None, **kwargs):
+        db.execute("""
+            INSERT INTO performance_metrics
+              (operation, contract_id, claim_id, started_at, completed_at, success, error_message, worker_id, model_used, photo_count)
+            VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+        """, (operation, contract_id, claim_id, started_at, success, error,
+              kwargs.get("worker_id"), kwargs.get("model"), kwargs.get("photo_count")))
+        db.commit()
+    ```
+
+    Usage in worker pipeline:
+    ```python
+    t0 = datetime.utcnow()
+    exif_data = extract_exif(image_bytes)
+    record_metric(db, "exif", contract_id, claim_id, t0)
+
+    t1 = datetime.utcnow()
+    vision_results = reverse_image_lookup(gs_uri)
+    record_metric(db, "vision", contract_id, claim_id, t1)
+
+    t2 = datetime.utcnow()
+    gemini_results = analyze_claim_with_gemini(prompt, images, api_key)
+    record_metric(db, "gemini", contract_id, claim_id, t2, model=config.gemini_model)
+    ```
+
+C. Latency & Throughput Views
+
+    ```sql
+    -- Average latency by operation (last 24 hours)
+    CREATE OR REPLACE VIEW latency_summary AS
+    SELECT
+        operation,
+        COUNT(*) AS total_ops,
+        ROUND(AVG(duration_ms)) AS avg_ms,
+        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)) AS p50_ms,
+        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)) AS p95_ms,
+        ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)) AS p99_ms,
+        MIN(duration_ms) AS min_ms,
+        MAX(duration_ms) AS max_ms
+    FROM performance_metrics
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY operation;
+
+    -- Throughput by hour
+    CREATE OR REPLACE VIEW throughput_hourly AS
+    SELECT
+        DATE_TRUNC('hour', created_at) AS hour,
+        operation,
+        COUNT(*) AS operations,
+        COUNT(*) FILTER (WHERE success = true) AS successes,
+        COUNT(*) FILTER (WHERE success = false) AS failures
+    FROM performance_metrics
+    GROUP BY DATE_TRUNC('hour', created_at), operation
+    ORDER BY hour DESC;
+    ```
+
+D. Golden Dataset (Baseline Heuristics)
+
+    A curated set of test images with known expected results. Used for:
+    - Nightly regression: "does this image still produce the expected result?"
+    - Pre-PR impact test: "did my prompt change break known-good detections?"
+
+    ```sql
+    CREATE TABLE golden_dataset (
+        id                  SERIAL PRIMARY KEY,
+        name                VARCHAR(255) NOT NULL,        -- "recycled_stock_photo_001"
+        storage_key         TEXT NOT NULL,                 -- GCS object path
+        expected_risk_min   REAL NOT NULL,                 -- e.g. 80 (should score >= 80)
+        expected_risk_max   REAL NOT NULL,                 -- e.g. 100
+        expected_flags      TEXT[],                        -- flags that MUST appear
+        must_not_flags      TEXT[],                        -- flags that must NOT appear
+        expected_tire_brand VARCHAR(100),
+        expected_color      VARCHAR(100),
+        notes               TEXT,
+        created_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+    ```
+
+    Example golden records:
+    ```sql
+    INSERT INTO golden_dataset (name, storage_key, expected_risk_min, expected_risk_max, expected_flags) VALUES
+      ('recycled_stock_photo',    'golden/recycled_01.jpg',  80, 100, ARRAY['Exact web match found']),
+      ('clean_legitimate_claim',  'golden/clean_01.jpg',     0,  30,  ARRAY[]::TEXT[]),
+      ('tire_brand_swap',         'golden/tire_swap_01.jpg', 60, 100, ARRAY['Tire brand changed']),
+      ('gps_mismatch',            'golden/gps_bad_01.jpg',   70, 100, ARRAY['GPS mismatch']);
+    ```
+
+E. Nightly Regression Runner
+
+    ```python
+    # scripts/golden_test.py
+    def run_golden_tests(db, config):
+        """Re-analyze all golden dataset images and validate against expected results."""
+        golden = db.execute("SELECT * FROM golden_dataset").fetchall()
+        passed, failed = 0, 0
+
+        for item in golden:
+            result = process_single_photo(item.storage_key, config)
+            score = result["risk_score"]
+
+            # Check risk score range
+            if not (item.expected_risk_min <= score <= item.expected_risk_max):
+                print(f"FAIL {item.name}: score {score} not in [{item.expected_risk_min}, {item.expected_risk_max}]")
+                failed += 1
+                continue
+
+            # Check required flags exist
+            result_flags = " ".join(result.get("red_flags", []))
+            missing = [f for f in (item.expected_flags or []) if f.lower() not in result_flags.lower()]
+            if missing:
+                print(f"FAIL {item.name}: missing expected flags: {missing}")
+                failed += 1
+                continue
+
+            passed += 1
+            print(f"PASS {item.name}: score={score}")
+
+        print(f"\nGolden dataset: {passed} passed, {failed} failed out of {len(golden)}")
+        return failed == 0
+    ```
+
+
+================================================================================
+SECTION 20 — PIPELINE LOGGING & NOTIFICATIONS
+================================================================================
+Every step in the pipeline is logged to a structured table in Postgres. This
+covers user actions, image processing steps, batch job lifecycle, warnings, and
+errors. Critical errors trigger notifications.
+
+A. Pipeline Logs Table
+
+    ```sql
+    CREATE TABLE pipeline_logs (
+        id              SERIAL PRIMARY KEY,
+        log_level       VARCHAR(10) NOT NULL,  -- INFO, WARN, ERROR
+        category        VARCHAR(50) NOT NULL,  -- 'user', 'image', 'batch', 'system'
+        operation       VARCHAR(100) NOT NULL, -- 'photo_upload', 'exif_extract', 'gemini_call', etc.
+        contract_id     VARCHAR(100),
+        claim_id        VARCHAR(100),
+        user_id         INTEGER,
+        worker_id       VARCHAR(50),
+        message         TEXT NOT NULL,
+        details         JSONB,                 -- extra context (error traces, request IDs, etc.)
+        duration_ms     INTEGER,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX idx_logs_level ON pipeline_logs(log_level, created_at DESC);
+    CREATE INDEX idx_logs_category ON pipeline_logs(category, created_at DESC);
+    CREATE INDEX idx_logs_contract ON pipeline_logs(contract_id, created_at DESC);
+    ```
+
+B. Logging Helper (shared by api + worker)
+
+    ```python
+    import json
+    from datetime import datetime
+
+    def log_pipeline(db, level, category, operation, message, **kwargs):
+        """Write a structured log entry to the pipeline_logs table."""
+        db.execute("""
+            INSERT INTO pipeline_logs
+              (log_level, category, operation, contract_id, claim_id, user_id,
+               worker_id, message, details, duration_ms)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            level, category, operation,
+            kwargs.get("contract_id"), kwargs.get("claim_id"),
+            kwargs.get("user_id"), kwargs.get("worker_id"),
+            message,
+            json.dumps(kwargs.get("details")) if kwargs.get("details") else None,
+            kwargs.get("duration_ms"),
+        ))
+        db.commit()
+    ```
+
+C. What Gets Logged (by category)
+
+    USER actions (logged in api service):
+      - Login success / failure
+      - Photo upload
+      - Photo Q&A question asked
+      - Prompt created / updated / deleted
+      - Dashboard queries (optional, for audit)
+
+    IMAGE processing (logged in worker service):
+      - EXIF extraction: success/failure, duration, fields found
+      - Cloud Vision call: success/failure, duration, match counts
+      - Gemini call: success/failure, duration, model used, risk score returned
+      - Result stored in DB
+
+    BATCH lifecycle (logged in worker service):
+      - Batch job started / completed / failed
+      - Per-job progress (X of Y completed)
+
+    SYSTEM events (logged in api or worker):
+      - Service startup / shutdown
+      - Health check results
+      - DB connection issues
+      - GCS connectivity issues
+
+D. Error Notifications
+
+    When a log entry has level=ERROR, fire a notification. In POC this means
+    an email via the Exchange service (Section 21). Later, add Slack webhooks.
+
+    ```python
+    def log_and_notify(db, category, operation, message, **kwargs):
+        """Log an ERROR and send a notification."""
+        log_pipeline(db, "ERROR", category, operation, message, **kwargs)
+
+        # Send email notification for errors
+        from services.email import send_alert_email
+        send_alert_email(
+            subject=f"[FRAUD SYSTEM ERROR] {operation}",
+            body=f"{message}\n\nDetails: {json.dumps(kwargs.get('details', {}), indent=2)}",
+        )
+    ```
+
+E. Log Retention
+
+    ```sql
+    -- Nightly cleanup: keep 90 days of INFO, 1 year of WARN/ERROR
+    DELETE FROM pipeline_logs
+    WHERE (log_level = 'INFO' AND created_at < NOW() - INTERVAL '90 days')
+       OR (log_level = 'WARN' AND created_at < NOW() - INTERVAL '365 days');
+    ```
+
+
+================================================================================
+SECTION 21 — EMAIL SERVICE (EXCHANGE)
+================================================================================
+The worker service sends email alerts via the organization's Exchange server.
+Uses the exchangelib Python library, which supports Exchange Web Services (EWS)
+natively — no SMTP relay needed.
+
+A. Exchange Service Class (worker/services/email.py)
+
+    ```python
+    import os
+    from exchangelib import (
+        Credentials, Account, Configuration,
+        Message, Mailbox, HTMLBody, DELEGATE
+    )
+
+    class EmailService:
+        """Send email alerts via Microsoft Exchange (EWS)."""
+
+        def __init__(self):
+            self.email = os.getenv("EXCHANGE_EMAIL")
+            self.password = os.getenv("EXCHANGE_PASSWORD")
+            self.server = os.getenv("EXCHANGE_SERVER")
+            self._account = None
+
+        @property
+        def account(self):
+            if self._account is None and self.email:
+                credentials = Credentials(self.email, self.password)
+                config = Configuration(
+                    server=self.server,
+                    credentials=credentials,
+                )
+                self._account = Account(
+                    self.email,
+                    config=config,
+                    autodiscover=False,
+                    access_type=DELEGATE,
+                )
+            return self._account
+
+        def send(self, to: list[str], subject: str, body: str, is_html: bool = False):
+            """Send an email. Silently skips if Exchange is not configured."""
+            if not self.account:
+                print("Email not configured — skipping notification")
+                return
+
+            msg = Message(
+                account=self.account,
+                subject=subject,
+                body=body,
+                to_recipients=[Mailbox(email_address=addr) for addr in to],
+            )
+            if is_html:
+                msg.body = HTMLBody(body)
+            msg.send()
+
+    # Singleton instance
+    email_service = EmailService()
+
+    def send_alert_email(subject: str, body: str, to: list[str] = None):
+        """Convenience function — sends to default alert recipients."""
+        recipients = to or os.getenv("ALERT_RECIPIENTS", "").split(",")
+        recipients = [r.strip() for r in recipients if r.strip()]
+        if recipients:
+            email_service.send(recipients, subject, body)
+    ```
+
+B. Environment Variables
+
+    | Variable            | Required | Description                            |
+    |---------------------|----------|----------------------------------------|
+    | EXCHANGE_EMAIL      | No       | Exchange account email address          |
+    | EXCHANGE_PASSWORD   | No       | Exchange account password               |
+    | EXCHANGE_SERVER     | No       | Exchange server hostname                |
+    | ALERT_RECIPIENTS    | No       | Comma-separated list of alert emails   |
+
+    If EXCHANGE_EMAIL is not set, all email calls silently no-op.
+    This keeps the system functional in dev/test without Exchange.
+
+C. When Emails Are Sent
+
+    | Trigger                          | Template Prompt Slug       | Recipients         |
+    |----------------------------------|----------------------------|--------------------|
+    | Claim processed with risk >= 80  | high_risk_email_template   | ALERT_RECIPIENTS   |
+    | Processing error (worker)        | (hardcoded error format)   | ALERT_RECIPIENTS   |
+    | Golden dataset regression failure| (hardcoded test format)    | ALERT_RECIPIENTS   |
+    | Daily summary (nightly cron)     | (future)                   | ALERT_RECIPIENTS   |
+
+D. Integration in Worker Pipeline
+
+    ```python
+    # In the worker's main processing loop, after Gemini analysis:
+    if result["risk_score"] >= 80:
+        prompt_template = get_active_prompt(db, "high_risk_email_template")
+        body = prompt_template.format(
+            claim_id=claim_id,
+            contract_id=contract_id,
+            risk_score=result["risk_score"],
+            red_flags=", ".join(result["red_flags"]),
+            dashboard_url=f"{BASE_URL}/claims/{contract_id}/{claim_id}",
+        )
+        send_alert_email(
+            subject=f"HIGH RISK: Claim {claim_id} scored {result['risk_score']}",
+            body=body,
+        )
+    ```
