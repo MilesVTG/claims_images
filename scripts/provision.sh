@@ -53,7 +53,11 @@ set -euo pipefail
 PROJECT_ID=$(gcloud config get-value project)
 REGION="${GCP_REGION:-us-central1}"
 
-echo "=== Provisioning GCP Project: $PROJECT_ID ==="
+echo ""
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "\033[1m  PROVISION — Claims Photo Fraud Detection\033[0m\n"
+printf "\033[1m  Project: ${PROJECT_ID}\033[0m\n"
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
 
 # Enable required APIs
 APIS=(
@@ -69,64 +73,67 @@ APIS=(
   cloudbuild.googleapis.com
 )
 
+echo ""
+printf "\033[1m─ Enabling APIs\033[0m\n"
 for api in "${APIS[@]}"; do
   echo "  Enabling ${api} ..."
   gcloud services enable "$api" --project="$PROJECT_ID"
 done
 echo "  All APIs enabled."
 
-# Create Artifact Registry repo (if not exists)
-gcloud artifacts repositories describe claims-images \
-  --location="$REGION" --project="$PROJECT_ID" 2>/dev/null || \
-gcloud artifacts repositories create claims-images \
-  --repository-format=docker \
-  --location="$REGION" \
-  --project="$PROJECT_ID"
-
-# Load secrets from .env
-SCRIPT_DIR_TMP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR_TMP}/../.env"
+echo ""
+printf "\033[1m─ Loading .env\033[0m\n"
+ENV_FILE="${SCRIPT_DIR}/../.env"
 if [[ -f "$ENV_FILE" ]]; then
   echo "  Loading secrets from .env"
   set -a; source "$ENV_FILE"; set +a
+  export TF_VAR_db_password="${DB_PASSWORD:-}"
+  export TF_VAR_project_id="${PROJECT_ID}"
 else
   echo "  ERROR: .env not found at $ENV_FILE — create it with secret values first"
   exit 1
 fi
 
-# Map .env variable names to Secret Manager secret names
-declare -A SECRET_MAP=(
-  ["gemini-api-key"]="$GEMINI_API_KEY"
-  ["db-password"]="$DB_PASSWORD"
-  ["session-secret"]="$SESSION_SECRET"
-  ["exchange-password"]="$EXCHANGE_PASSWORD"
-)
-
-for secret_name in "${!SECRET_MAP[@]}"; do
-  value="${SECRET_MAP[$secret_name]}"
-  if [[ -z "$value" ]]; then
-    echo "  WARNING: No value for $secret_name in .env, skipping"
-    continue
-  fi
-  if ! gcloud secrets describe "$secret_name" --project="$PROJECT_ID" &>/dev/null; then
-    echo "  Creating secret: $secret_name"
-    echo -n "$value" | gcloud secrets create "$secret_name" \
-      --data-file=- --project="$PROJECT_ID"
-  else
-    echo "  Secret $secret_name already exists (use 'gcloud secrets versions add' to update)"
-  fi
-done
-
-# Run Terraform
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Run Terraform (creates: Artifact Registry, secrets, Cloud SQL, VPC, GCS, Pub/Sub, IAM)
 TERRAFORM_DIR="${SCRIPT_DIR}/../terraform"
 
-echo "=== Running Terraform ==="
+echo ""
+printf "\033[1m─ Terraform\033[0m\n"
 cd "$TERRAFORM_DIR"
 terraform init
-terraform plan -var="project_id=$PROJECT_ID"
+terraform plan -var="project_id=$PROJECT_ID" -var="db_password=${DB_PASSWORD:-}"
 echo ""
 read -p "Apply? (y/N): " confirm
-[[ "$confirm" == "y" ]] && terraform apply -var="project_id=$PROJECT_ID"
+[[ "$confirm" == "y" ]] && terraform apply -var="project_id=$PROJECT_ID" -var="db_password=${DB_PASSWORD:-}"
 
-echo "=== Provisioning complete ==="
+# Push secret values to Secret Manager (Terraform creates the secrets, this adds the values)
+echo ""
+printf "\033[1m─ Secret Values\033[0m\n"
+push_secret() {
+  local secret_name="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    echo "  WARNING: No value for $secret_name in .env, skipping"
+    return
+  fi
+  local version_count
+  version_count=$(gcloud secrets versions list "$secret_name" --project="$PROJECT_ID" --format='value(name)' 2>/dev/null | wc -l)
+  if [[ "$version_count" -eq 0 ]]; then
+    echo "  Adding value for: $secret_name"
+    echo -n "$value" | gcloud secrets versions add "$secret_name" \
+      --data-file=- --project="$PROJECT_ID"
+  else
+    echo "  $secret_name already has a value (use 'gcloud secrets versions add' to update)"
+  fi
+}
+
+push_secret "gemini-api-key"    "${GEMINI_API_KEY:-}"
+push_secret "db-password"       "${DB_PASSWORD:-}"
+push_secret "session-secret"    "${SESSION_SECRET:-}"
+push_secret "exchange-password" "${EXCHANGE_PASSWORD:-}"
+
+echo ""
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "\033[1m  Provisioning complete\033[0m\n"
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+echo "Next: ./scripts/deploy.sh --all"

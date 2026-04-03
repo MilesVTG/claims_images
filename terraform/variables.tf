@@ -20,3 +20,9 @@ variable "db_password" {
   type        = string
   sensitive   = true
 }
+
+variable "deletion_protection" {
+  description = "Cloud SQL deletion protection (set false for teardown)"
+  type        = bool
+  default     = true
+}

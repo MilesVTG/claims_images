@@ -81,20 +81,24 @@ check() {
   fi
 }
 
-echo "=== Preflight ==="
+echo ""
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "\033[1m  PREFLIGHT — Claims Photo Fraud Detection\033[0m\n"
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
 
 # ── Auth & Config ──────────────────────────────────────────────────
 echo ""
-echo "GCP Auth"
+printf "\033[1m─ GCP Auth\033[0m\n"
 check "gcloud CLI installed" which gcloud
 check "gcloud authenticated" gcloud auth print-access-token
+check "Application Default Credentials" gcloud auth application-default print-access-token
 check "Project set" gcloud config get-value project
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "")
 
 # ── .env ───────────────────────────────────────────────────────────
 echo ""
-echo "Local .env"
+printf "\033[1m─ Local .env\033[0m\n"
 check ".env file exists" test -f "$ENV_FILE"
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -109,7 +113,7 @@ fi
 
 # ── Tools ──────────────────────────────────────────────────────────
 echo ""
-echo "Tools"
+printf "\033[1m─ Tools\033[0m\n"
 check "terraform" which terraform
 check "docker" which docker
 check "node" which node
@@ -118,19 +122,26 @@ check "Docker daemon" docker info
 
 # ── GCP Project ────────────────────────────────────────────────────
 echo ""
-echo "GCP Project"
+printf "\033[1m─ GCP Project\033[0m\n"
 check "Project accessible" gcloud projects describe "$PROJECT_ID"
 check "Billing enabled" bash -c "gcloud billing projects describe $PROJECT_ID 2>/dev/null | grep -q 'billingEnabled: true'"
 
 
+# ── Terraform ─────────────────────────────────────────────────────
+echo ""
+printf "\033[1m─ Terraform\033[0m\n"
+check "terraform validate" bash -c "cd ${PROJECT_ROOT}/terraform && terraform init -backend=false -input=false >/dev/null 2>&1 && terraform validate"
+
 # ── Git ────────────────────────────────────────────────────────────
 echo ""
-echo "Safety"
+printf "\033[1m─ Safety\033[0m\n"
 check ".env gitignored" git check-ignore "$ENV_FILE"
 
 # ── Summary ────────────────────────────────────────────────────────
 echo ""
-echo "=== ${PASS} passed, ${FAIL} failed ==="
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "\033[1m  ${PASS} passed, ${FAIL} failed\033[0m\n"
+printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
 
 if [[ "$HAS_ERRORS" == true ]]; then
   echo "Errors logged to: ${LOG_FILE}"
@@ -139,5 +150,5 @@ fi
 
 # No errors — no log file needed
 rm -f "$LOG_FILE"
-echo "All clear."
+printf "\033[32mAll clear.\033[0m\n"
 exit 0

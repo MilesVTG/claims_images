@@ -59,7 +59,8 @@ resource "google_sql_database_instance" "fraud_db" {
 
   settings {
     tier              = var.db_tier
-    availability_type = "REGIONAL"
+    edition           = "ENTERPRISE"
+    availability_type = "ZONAL"
 
     ip_configuration {
       ipv4_enabled    = false
@@ -72,7 +73,7 @@ resource "google_sql_database_instance" "fraud_db" {
     }
   }
 
-  deletion_protection = true
+  deletion_protection = var.deletion_protection
 }
 
 resource "google_sql_database" "fraud_detection" {
@@ -94,8 +95,13 @@ resource "google_storage_bucket" "photos" {
   versioning { enabled = true }
 
   lifecycle_rule {
-    action { type = "SetStorageClass" storage_class = "NEARLINE" }
-    condition { age = 90 }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+    condition {
+      age = 90
+    }
   }
 }
 
@@ -116,13 +122,22 @@ resource "google_pubsub_subscription" "worker_sub" {
   ack_deadline_seconds = 300
 }
 
+# Grant GCS service account permission to publish to Pub/Sub
+data "google_storage_project_service_account" "gcs_sa" {}
+
+resource "google_pubsub_topic_iam_member" "gcs_publish" {
+  topic  = google_pubsub_topic.photo_uploads.id
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${data.google_storage_project_service_account.gcs_sa.email_address}"
+}
+
 resource "google_storage_notification" "photo_notification" {
   bucket         = google_storage_bucket.photos.name
   payload_format = "JSON_API_V1"
   topic          = google_pubsub_topic.photo_uploads.id
   event_types    = ["OBJECT_FINALIZE"]
 
-  depends_on = [google_pubsub_topic.photo_uploads]
+  depends_on = [google_pubsub_topic_iam_member.gcs_publish]
 }
 
 # ── Artifact Registry (Docker image storage) ─────────────────────────
@@ -135,17 +150,23 @@ resource "google_artifact_registry_repository" "claims_images" {
 # ── Secret Manager ───────────────────────────────────────────────────
 resource "google_secret_manager_secret" "gemini_api_key" {
   secret_id = "gemini-api-key"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
 }
 
 resource "google_secret_manager_secret" "session_secret" {
   secret_id = "session-secret"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
 }
 
 resource "google_secret_manager_secret" "exchange_password" {
   secret_id = "exchange-password"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
 }
 
 # ── Service Accounts ─────────────────────────────────────────────────
@@ -204,6 +225,8 @@ resource "google_vpc_access_connector" "connector" {
   region        = var.region
   network       = google_compute_network.vpc.name
   ip_cidr_range = "10.8.0.0/28"
+  min_instances = 2
+  max_instances = 3
 }
 
 # ── Cloud Run services are NOT managed by Terraform ──────────────────
