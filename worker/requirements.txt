@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+google-cloud-storage
+google-generativeai
+google-cloud-vision
+pillow
+pg8000
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+exchangelib
+cloud-sql-python-connector[pg8000]

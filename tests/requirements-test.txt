@@ -1,0 +1,11 @@
+pytest
+httpx
+python-jose[cryptography]
+passlib[bcrypt]
+sqlalchemy
+pydantic
+pydantic-settings
+fastapi
+pillow
+piexif
+python-dotenv

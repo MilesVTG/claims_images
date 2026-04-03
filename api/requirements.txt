@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+google-cloud-storage
+google-generativeai
+google-cloud-vision
+pillow
+pg8000
+sqlalchemy
+alembic
+pydantic
+pydantic-settings
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+cloud-sql-python-connector[pg8000]
