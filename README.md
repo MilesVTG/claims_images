@@ -8,45 +8,208 @@ Automatically detect recycled stock photos, tire brand changes, vehicle color sw
 
 ## Overview
 
-This system ingests claim photos from Google Cloud Storage, runs multimodal AI analysis with Gemini, performs reverse image lookup, extracts EXIF metadata, and surfaces clear fraud risk scores and red flags through a React dashboard.
+This system ingests claim photos from Google Cloud Storage, runs multimodal AI analysis with Gemini, performs reverse image lookup, extracts EXIF metadata, and surfaces fraud risk scores and red flags through a React dashboard.
 
-Built entirely with GCP-native services (Cloud Run, Cloud SQL Postgres, GCS, Pub/Sub, Gemini, Cloud Vision) and designed with a strict **script-first** philosophy — no manual changes to production.
+Built entirely with GCP-native services (Cloud Run, Cloud SQL Postgres 17, GCS, Pub/Sub, Gemini, Cloud Vision) and designed with a strict **script-first** philosophy — no manual changes to production.
 
 **Key Capabilities**
-- Per-photo processing (EXIF + Cloud Vision)
-- Claim-level Gemini fraud analysis (aggregates all photos per claim)
-- Risk scoring (0–100) with explainable red flags
-- Real-time dashboard for claims team
+- Per-photo processing (EXIF extraction + Cloud Vision reverse image search)
+- Claim-level Gemini multimodal fraud analysis (aggregates all photos per claim with contract history)
+- Composite risk scoring (0-100) with weighted signals and explainable red flags
+- React dashboard for claims team review
 - High-risk email alerts via Microsoft Exchange
+- Configurable Gemini prompts with versioning and audit trail
 - Golden dataset for regression testing
-- Fully scripted provisioning and deployment
+- Fully scripted provisioning, deployment, and teardown
 
 ---
 
 ## Architecture
 
-See **Implementation Plan 5 — Comprehensive** for full details.
+```
+                    ┌─────────────┐
+                    │   GCS       │
+                    │ claim-photos│
+                    └──────┬──────┘
+                           │ upload event
+                    ┌──────▼──────┐
+                    │   Pub/Sub   │
+                    └──────┬──────┘
+                           │ push
+                    ┌──────▼──────┐
+                    │   Worker    │ Cloud Run
+                    │ (processing)│
+                    └──────┬──────┘
+                           │ EXIF + Vision + Gemini
+                    ┌──────▼──────┐
+                    │  Cloud SQL  │ Postgres 17
+                    │  (results)  │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │                         │
+       ┌──────▼──────┐          ┌──────▼──────┐
+       │     API     │          │  Dashboard  │
+       │  (FastAPI)  │          │ (React+nginx)│
+       │  Cloud Run  │          │  Cloud Run  │
+       └─────────────┘          └─────────────┘
+```
 
-High-level flow:
-1. Photos uploaded to GCS (`{PROJECT_ID}-claim-photos/{contract_id}/{claim_id}/...`)
-2. Pub/Sub triggers worker
-3. Per-photo: EXIF extraction + Cloud Vision reverse image lookup
-4. Claim-level: Gemini multimodal analysis against contract history
-5. Results stored in Cloud SQL Postgres
-6. Claims team reviews via React SPA dashboard served by nginx
-
-Core components:
-- **Cloud Run Services**: `nginx` (dashboard), `api` (FastAPI), `worker` (processing)
-- **Database**: Cloud SQL Postgres 17
-- **Storage**: Google Cloud Storage
-- **AI**: Gemini Enterprise + Cloud Vision
-- **Infra**: Terraform + Bash/Python scripts
+1. Photos uploaded to GCS (`{project_id}-claim-photos/{contract_id}/{claim_id}/...`)
+2. GCS notification triggers Pub/Sub → pushes to Worker
+3. **Per-photo**: EXIF extraction + Cloud Vision reverse image search
+4. **Claim-level**: Gemini multimodal analysis against contract history
+5. Composite risk score computed (Gemini 50%, web matches 20%, EXIF 30%)
+6. Results stored in Cloud SQL Postgres (claims table with JSONB)
+7. Claims team reviews via React SPA dashboard
+8. High-risk claims (score >= 80) trigger email alerts
 
 ---
 
-## Quick Start (POC)
+## Services
+
+| Service | Stack | Cloud Run | Port | Resources |
+|---------|-------|-----------|------|-----------|
+| API | FastAPI + SQLAlchemy | claims-api | 8080 | 512Mi / 1 CPU |
+| Worker | Python + Gemini + Vision | claims-worker | 8080 | 1Gi / 2 CPU |
+| Dashboard | React 18 + Vite + nginx | claims-dashboard | 80 | 256Mi / 1 CPU |
+
+### API Endpoints
+- `POST /api/auth/login` — JWT authentication
+- `GET /api/claims` — List claims with pagination, risk filters, sorting
+- `GET /api/claims/{contract_id}/{claim_id}` — Claim detail with photos and history
+- `GET /api/dashboard/summary` — KPI aggregates for dashboard
+- `GET/POST /api/prompts` — Gemini prompt management with versioning
+- `GET /api/health` — Health check with DB connectivity
+
+### Worker Pipeline
+- `POST /process` — Pub/Sub push handler (GCS upload events)
+- EXIF extraction (camera, GPS, timestamps, editing software detection)
+- Cloud Vision (reverse image search, label detection, web entities)
+- Gemini multimodal analysis (fraud assessment with all claim photos)
+- Composite risk scoring with explainable weights
+- Email alerts for high-risk claims via Exchange EWS
+
+### Dashboard Pages
+- Login — JWT auth with seeded POC users
+- Dashboard — KPI cards, recent high-risk claims
+- Claims List — Filterable, sortable table with risk badges
+- Claim Detail — Full analysis results, photo gallery, red flags
+
+---
+
+## Database
+
+Cloud SQL Postgres 17 with 6 tables:
+
+| Table | Purpose |
+|-------|---------|
+| `claims` | Fraud detection results (risk scores, JSONB analysis, red flags) |
+| `processed_photos` | Idempotency tracking per photo |
+| `users` | POC authentication (seeded users, bcrypt, JWT) |
+| `system_prompts` | Configurable Gemini prompts with versioning |
+| `prompt_history` | Audit trail for prompt changes |
+| `golden_dataset` | Known fraud/clean samples for regression testing |
+
+Plus 2 SQL views: `claims_dashboard_view` and `daily_fraud_summary_view`.
+
+Managed via Alembic migrations (`api/alembic/versions/`).
+
+---
+
+## Infrastructure
+
+All GCP resources managed by Terraform (`terraform/`):
+
+- **Cloud SQL** — Postgres 17, private networking, ENTERPRISE edition
+- **VPC** — Private network with peering for Cloud SQL
+- **VPC Connector** — Cloud Run → Cloud SQL private access
+- **GCS** — Photo storage with versioning, 90-day lifecycle to NEARLINE
+- **Pub/Sub** — Topic + push subscription for GCS upload events
+- **Artifact Registry** — Docker image storage
+- **Secret Manager** — API keys, DB password, session secret, Exchange password
+- **Service Accounts** — Scoped IAM (claims-api, claims-worker)
+- **Cloud Run** — Deployed via `deploy.sh` (not Terraform, avoids state drift)
+
+---
+
+## Project Structure
+
+```
+claims_images/
+├── api/                    # FastAPI service
+│   ├── app/
+│   │   ├── routers/        # auth, claims, dashboard, health, photos, prompts
+│   │   ├── models/         # SQLAlchemy ORM (claim, user, prompt, etc.)
+│   │   ├── services/       # auth_service
+│   │   ├── config.py       # pydantic-settings
+│   │   ├── database.py     # Cloud SQL connector + local dev
+│   │   └── main.py         # FastAPI app
+│   ├── alembic/            # DB migrations
+│   ├── Dockerfile
+│   └── requirements.txt
+├── worker/                 # Processing service
+│   ├── app/
+│   │   ├── services/       # exif, vision, gemini, risk, email
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   └── main.py         # Pub/Sub handler
+│   ├── Dockerfile
+│   └── requirements.txt
+├── dashboard/              # React SPA
+│   ├── src/
+│   │   ├── pages/          # Login, Dashboard, ClaimsList, ClaimDetail
+│   │   ├── components/     # RiskBadge, PhotoGallery, RedFlagsList, etc.
+│   │   └── api/client.js   # API client with JWT
+│   ├── Dockerfile
+│   └── package.json
+├── terraform/              # Infrastructure as Code
+│   ├── main.tf
+│   ├── variables.tf
+│   └── outputs.tf
+├── scripts/
+│   ├── preflight.sh        # Pre-run validation
+│   ├── provision.sh        # One-time GCP infra setup
+│   ├── deploy.sh           # Build + deploy to Cloud Run
+│   ├── health_check.sh     # Post-deploy verification
+│   ├── teardown.sh         # Destroy all infra (keeps project)
+│   ├── seed.py             # Seed users, prompts, test data
+│   ├── seed_golden_dataset.py
+│   └── upload_test_photos.sh
+├── tests/
+│   ├── conftest.py         # Fixtures, SQLite test DB, factories
+│   ├── test_api_auth.py    # 11 tests
+│   ├── test_api_claims.py  # Postgres-only
+│   ├── test_api_dashboard.py
+│   ├── test_api_health.py  # 2 tests
+│   ├── test_api_prompts.py # 14+ tests
+│   ├── test_golden_regression.py
+│   └── test_pipeline_e2e.py
+├── .env                    # Local secrets (gitignored)
+├── .gitignore
+├── ARCHITECTURE.md
+├── INITIAL.md              # Requirements and design decisions
+├── ROADMAP.md              # Phased delivery plan
+└── README.md
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+- `gcloud` CLI authenticated (`gcloud auth login`)
+- Application Default Credentials (`gcloud auth application-default login`)
+- Project set (`gcloud config set project propane-landing-491118-r7`)
+- `.env` file with secrets (see INITIAL.md)
+- `terraform`, `docker`, `node`, `python3` installed
+
+### Setup
 
 ```bash
+# 0. Validate environment
+./scripts/preflight.sh
+
 # 1. Provision infrastructure
 ./scripts/provision.sh
 
@@ -54,89 +217,66 @@ Core components:
 ./scripts/deploy.sh --all
 
 # 3. Seed users, prompts, and test data
-source .env && python scripts/seed.py
+python scripts/seed.py
 
-# 4. Run health checks
+# 4. Verify everything is healthy
 ./scripts/health_check.sh
 
-# 5. Upload test photos and watch the pipeline run
+# 5. Upload test photos and watch the pipeline
 ./scripts/upload_test_photos.sh
 ```
 
-Once deployed:
-- **Dashboard URL** → from `gcloud run services describe claims-dashboard`
-- Login with seeded users (`miles` / `greg`)
-- Upload photos via the dashboard or directly to GCS
+### Teardown
 
----
-
-## Project Structure
-
-```text
-claims_images/
-├── api/                # FastAPI service
-├── worker/             # Background processing service
-├── dashboard/          # React SPA + nginx
-├── scripts/            # provision.sh, deploy.sh, seed.py, etc.
-├── terraform/          # Infrastructure as Code
-├── .env                # Local dev secrets (git-ignored)
-└── ROADMAP.md
+```bash
+./scripts/teardown.sh    # Type 'teardown' to confirm
 ```
 
-Full directory layout and Dockerfiles are detailed in Section 9H of the Implementation Plan.
+Destroys all infra, keeps the GCP project. Re-provision with `provision.sh`.
 
 ---
 
-## Roadmap
+## GCP Project
 
-See **ROADMAP.md** for the three-phase delivery plan:
-
-- **Phase 1: POC** — Working prototype to excite stakeholders (3–4 weeks)
-- **Phase 2: Version 1** — Production-ready core system (4–6 weeks)
-- **Phase 3: Version 1.1** — Full enterprise features (2–4 weeks)
-
----
-
-## Key References
-
-- **Implementation Plan 5** — `implementation_plan_5_comprehensive.txt` (the single source of truth)
-- **ROADMAP.md** — Phased delivery plan with success criteria
-- **Section 1B** — Operational Mandate: Script-first, no hotpatches
-
-> All code changes, infrastructure, and deployments must go through the provided scripts.
+| | |
+|---|---|
+| **Project** | `propane-landing-491118-r7` |
+| **Account** | `mchick@vtg-services.net` |
+| **Region** | `us-central1` |
 
 ---
 
-## Development & Deployment
+## Scripts Reference
 
-**Never** run `gcloud run deploy`, manual SQL, or SSH into containers in production.
-Use:
+| Script | Purpose | When to Run |
+|--------|---------|-------------|
+| `preflight.sh` | Validate env, auth, tools, GCP access | Before provision or deploy |
+| `provision.sh` | Enable APIs, Terraform apply, push secrets | First-time setup |
+| `deploy.sh` | Build Docker images, deploy to Cloud Run | After code changes |
+| `health_check.sh` | Verify services, APIs, infra are alive | After deploy |
+| `teardown.sh` | Destroy all infrastructure | Clean slate / cost savings |
+| `seed.py` | Seed users, prompts, test data | After first deploy |
 
-- `./scripts/provision.sh` — Terraform + secrets
-- `./scripts/deploy.sh [--all | api | worker | dashboard]` — Build & deploy
-- `./scripts/seed.py` — Seed users and default prompts
-- `./scripts/health_check.sh` — Verify everything is healthy
-
----
-
-## Documentation
-
-- Full technical specification: `implementation_plan_5_comprehensive.txt`
-- Detailed roadmap with checklists: `ROADMAP.md`
-- Database schema & SQL views: Sections 7–8
-- API endpoints: Section 14
-- Dashboard: Section 15
-- Processing pipeline: Sections 3–6
+All scripts have detailed comment headers with WHAT/WHY/WHEN/IF IT FAILS guidance.
 
 ---
 
-## Contributing & Maintenance
+## Status
 
-- All changes must be scripted and version-controlled.
-- Update the Implementation Plan first, then the code/scripts.
-- Run the full test suite (`scripts/test_suite.py`) and golden dataset regression before any deploy.
+**Phase 1 POC — In Progress**
 
----
+### Done
+- API service (auth, claims, dashboard, prompts, health)
+- Worker service (EXIF, Vision, Gemini, risk scoring, email alerts)
+- Database schema (6 tables, 2 views, Alembic migrations)
+- React dashboard (4 pages, API client with JWT)
+- Terraform IaC (all infra defined)
+- Scripts (preflight, provision, deploy, health check, teardown)
+- Test suite (auth, health, prompts coverage)
 
-*Built for insurance fraud detection*
-*Questions? Start with the Implementation Plan and ROADMAP.md.*
+### Remaining
+- Photo upload API endpoints (`/api/photos` — 4 TODOs)
+- Dashboard field mapping fixes
+- E2E integration test (full pipeline)
+- Golden dataset regression validation
+- GCP deploy + smoke test
