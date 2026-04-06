@@ -50,14 +50,23 @@ set -euo pipefail
 #
 ###############################################################################
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ID=$(gcloud config get-value project)
 REGION="${GCP_REGION:-us-central1}"
 
+# ── Colors ─────────────────────────────────────────────────────────
+C="\033[36m"       # cyan — banners
+O="\033[38;5;208m" # orange — section headers
+R="\033[31m"       # red — errors
+G="\033[32m"       # green — success
+B="\033[1m"        # bold
+X="\033[0m"        # reset
+
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
-printf "\033[1m  PROVISION — Claims Photo Fraud Detection\033[0m\n"
-printf "\033[1m  Project: ${PROJECT_ID}\033[0m\n"
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  PROVISION — Claims Photo Fraud Detection${X}\n"
+printf "${C}${B}  Project: ${PROJECT_ID}${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 
 # Enable required APIs
 APIS=(
@@ -74,15 +83,38 @@ APIS=(
 )
 
 echo ""
-printf "\033[1m─ Enabling APIs\033[0m\n"
+printf "${O}${B}─ Enabling APIs${X}\n"
 for api in "${APIS[@]}"; do
   echo "  Enabling ${api} ..."
   gcloud services enable "$api" --project="$PROJECT_ID"
 done
 echo "  All APIs enabled."
 
+# Cloud Build uses the Compute Engine default SA. It needs:
+#   1. storage.objectAdmin — pull/push build source from GCS
+#   2. artifactregistry.writer — push Docker images to Artifact Registry
+#   3. logging.logWriter — write build logs to Cloud Logging
 echo ""
-printf "\033[1m─ Loading .env\033[0m\n"
+printf "${O}${B}─ IAM: Cloud Build Service Account${X}\n"
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+CLOUD_BUILD_ROLES=(
+  roles/storage.objectAdmin
+  roles/artifactregistry.writer
+  roles/logging.logWriter
+)
+for role in "${CLOUD_BUILD_ROLES[@]}"; do
+  echo "  Granting ${role} to default compute SA ..."
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${COMPUTE_SA}" \
+    --role="$role" \
+    --condition=None \
+    --quiet > /dev/null
+done
+echo "  Done."
+
+echo ""
+printf "${O}${B}─ Loading .env${X}\n"
 ENV_FILE="${SCRIPT_DIR}/../.env"
 if [[ -f "$ENV_FILE" ]]; then
   echo "  Loading secrets from .env"
@@ -98,7 +130,7 @@ fi
 TERRAFORM_DIR="${SCRIPT_DIR}/../terraform"
 
 echo ""
-printf "\033[1m─ Terraform\033[0m\n"
+printf "${O}${B}─ Terraform${X}\n"
 cd "$TERRAFORM_DIR"
 terraform init
 terraform plan -var="project_id=$PROJECT_ID" -var="db_password=${DB_PASSWORD:-}"
@@ -108,32 +140,34 @@ read -p "Apply? (y/N): " confirm
 
 # Push secret values to Secret Manager (Terraform creates the secrets, this adds the values)
 echo ""
-printf "\033[1m─ Secret Values\033[0m\n"
+printf "${O}${B}─ Secret Values${X}\n"
 push_secret() {
   local secret_name="$1"
   local value="$2"
   if [[ -z "$value" ]]; then
-    echo "  WARNING: No value for $secret_name in .env, skipping"
-    return
+    printf "  ${R}ERROR: No value for $secret_name in .env — deploy will fail without this${X}\n"
+    return 1
   fi
-  local version_count
-  version_count=$(gcloud secrets versions list "$secret_name" --project="$PROJECT_ID" --format='value(name)' 2>/dev/null | wc -l)
-  if [[ "$version_count" -eq 0 ]]; then
-    echo "  Adding value for: $secret_name"
-    echo -n "$value" | gcloud secrets versions add "$secret_name" \
-      --data-file=- --project="$PROJECT_ID"
-  else
-    echo "  $secret_name already has a value (use 'gcloud secrets versions add' to update)"
+  # Ensure the secret shell exists (Terraform should create it, but be safe)
+  if ! gcloud secrets describe "$secret_name" --project="$PROJECT_ID" &>/dev/null; then
+    echo "  Creating secret shell: $secret_name"
+    gcloud secrets create "$secret_name" --replication-policy=automatic --project="$PROJECT_ID"
   fi
+  # Always push — latest value from .env wins
+  echo "  Pushing value for: $secret_name"
+  echo -n "$value" | gcloud secrets versions add "$secret_name" \
+    --data-file=- --project="$PROJECT_ID"
 }
 
-push_secret "gemini-api-key"    "${GEMINI_API_KEY:-}"
-push_secret "db-password"       "${DB_PASSWORD:-}"
-push_secret "session-secret"    "${SESSION_SECRET:-}"
-push_secret "exchange-password" "${EXCHANGE_PASSWORD:-}"
+push_secret "gemini-api-key"       "${GEMINI_API_KEY:-}"
+push_secret "db-password"          "${DB_PASSWORD:-}"
+push_secret "session-secret"       "${SESSION_SECRET:-}"
+push_secret "exchange-password"    "${EXCHANGE_PASSWORD:-}"
+push_secret "seed-user-1-password" "${SEED_USER_1_PASSWORD:-}"
+push_secret "seed-user-2-password" "${SEED_USER_2_PASSWORD:-}"
 
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
-printf "\033[1m  Provisioning complete\033[0m\n"
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${G}${B}  Provisioning complete${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 echo "Next: ./scripts/deploy.sh --all"

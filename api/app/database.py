@@ -24,15 +24,15 @@ if DATABASE_URL:
     )
 else:
     # Cloud SQL connector path (production on Cloud Run)
-    from google.cloud.sql.connector import Connector
+    from google.cloud.sql.connector import Connector, IPTypes
 
     INSTANCE_CONNECTION_NAME = os.environ.get(
         "CLOUD_SQL_CONNECTION_NAME",
-        "claims-project:us-central1:claims-db",
+        "claims-project:us-central1:fraud-detection-db",
     )
     DB_USER = os.environ.get("DB_USER", "fraud_user")
     DB_PASS = os.environ.get("DB_PASSWORD", "")
-    DB_NAME = os.environ.get("DB_NAME", "claims")
+    DB_NAME = os.environ.get("DB_NAME", "fraud_detection")
 
     connector = Connector(refresh_strategy="lazy")
 
@@ -40,6 +40,7 @@ else:
         return connector.connect(
             INSTANCE_CONNECTION_NAME,
             "pg8000",
+            ip_type=IPTypes.PRIVATE,
             user=DB_USER,
             password=DB_PASS,
             db=DB_NAME,

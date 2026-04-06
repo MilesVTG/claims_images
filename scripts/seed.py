@@ -1,23 +1,47 @@
 """Seed script — create POC users and default Gemini system prompts (Sections 18B, 13B).
 
-Usage (local dev with Cloud SQL connector):
-    source .env && python scripts/seed.py
+Usage:
+    python3 scripts/seed.py
 
-Usage (local dev with direct Postgres):
-    DATABASE_URL=postgresql+pg8000://user:pass@localhost/claims python scripts/seed.py
+Loads .env automatically from the project root. No need to `source .env` first.
 
-Required env vars for Cloud SQL path:
-    CLOUD_SQL_CONNECTION_NAME, DB_PASSWORD, MILES_PW, GREG_PW
-Optional:
-    DB_USER (default: fraud_user), DB_NAME (default: claims), DATABASE_URL
+Seed users are read from .env as SEED_USER_N_EMAIL, SEED_USER_N_PASSWORD,
+SEED_USER_N_NAME, SEED_USER_N_ROLE (N = 1, 2, 3, ...).
 """
 
 import os
 import sys
+from pathlib import Path
 
+
+def _load_env():
+    """Load .env file from project root, exporting all vars to os.environ."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        # No .env is OK in Cloud Run — env vars are set by the platform
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Strip surrounding quotes
+            if (value.startswith("'") and value.endswith("'")) or \
+               (value.startswith('"') and value.endswith('"')):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_env()
+
+import bcrypt as _bcrypt
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
-from passlib.hash import bcrypt
 
 
 def _build_engine():
@@ -26,44 +50,80 @@ def _build_engine():
     if database_url:
         return create_engine(database_url)
 
-    from google.cloud.sql.connector import Connector
+    try:
+        from google.cloud.sql.connector import Connector
+    except ImportError:
+        print("ERROR: google-cloud-sql-connector not installed.")
+        print("  Install: pip install 'cloud-sql-python-connector[pg8000]'")
+        print("  Or set DATABASE_URL for direct Postgres access.")
+        sys.exit(1)
 
-    instance = os.environ["CLOUD_SQL_CONNECTION_NAME"]
-    db_user = os.environ.get("DB_USER", "fraud_user")
-    db_pass = os.environ["DB_PASSWORD"]
-    db_name = os.environ.get("DB_NAME", "claims")
+    # Build connection name: project:region:instance
+    instance = os.environ.get("CLOUD_SQL_CONNECTION_NAME")
+    if not instance:
+        project = os.environ.get("GCP_PROJECT_ID")
+        region = os.environ.get("GCP_REGION", "us-central1")
+        sql_instance = os.environ.get("CLOUD_SQL_INSTANCE", "fraud-detection-db")
+        if not project:
+            print("ERROR: Need CLOUD_SQL_CONNECTION_NAME or GCP_PROJECT_ID in .env")
+            sys.exit(1)
+        instance = f"{project}:{region}:{sql_instance}"
 
+    db_user = os.environ.get("CLOUD_SQL_USER", "fraud_user")
+    db_name = os.environ.get("CLOUD_SQL_DB", "fraud_detection")
+    db_pass = os.environ.get("DB_PASSWORD")
+    if not db_pass:
+        print("ERROR: DB_PASSWORD not set in .env")
+        sys.exit(1)
+
+    print(f"  Connecting to Cloud SQL: {instance} as {db_user}/{db_name}")
+
+    from google.cloud.sql.connector import IPTypes
     connector = Connector(refresh_strategy="lazy")
 
     def _getconn():
-        return connector.connect(instance, "pg8000", user=db_user, password=db_pass, db=db_name)
+        return connector.connect(instance, "pg8000", ip_type=IPTypes.PRIVATE, user=db_user, password=db_pass, db=db_name)
 
     return create_engine("postgresql+pg8000://", creator=_getconn)
 
 
-def seed_users(session: Session) -> None:
-    """Insert POC users (miles, greg). Passwords MUST be set in env."""
-    miles_pw = os.environ.get("MILES_PW")
-    greg_pw = os.environ.get("GREG_PW")
-
-    if not miles_pw or not greg_pw:
-        print("ERROR: MILES_PW and GREG_PW environment variables are required.")
+def _load_seed_users() -> list[tuple[str, str, str, str]]:
+    """Read SEED_USER_N_* env vars. Returns list of (email, password, name, role)."""
+    users = []
+    n = 1
+    while True:
+        email = os.environ.get(f"SEED_USER_{n}_EMAIL")
+        if not email:
+            break
+        password = os.environ.get(f"SEED_USER_{n}_PASSWORD")
+        if not password:
+            print(f"ERROR: SEED_USER_{n}_PASSWORD is required for {email}")
+            sys.exit(1)
+        name = os.environ.get(f"SEED_USER_{n}_NAME", email.split("@")[0])
+        role = os.environ.get(f"SEED_USER_{n}_ROLE", "reviewer")
+        users.append((email, password, name, role))
+        n += 1
+    if not users:
+        print("ERROR: No seed users found. Set SEED_USER_1_EMAIL / SEED_USER_1_PASSWORD in .env")
         sys.exit(1)
+    return users
 
-    users = [
-        ("miles", miles_pw, "Miles", "admin"),
-        ("greg", greg_pw, "Greg", "admin"),
-    ]
 
-    for username, password, display_name, role in users:
-        pw_hash = bcrypt.hash(password)
+def seed_users(session: Session) -> None:
+    """Insert seed users from .env (SEED_USER_N_* vars)."""
+    users = _load_seed_users()
+    for email, password, display_name, role in users:
+        pw_hash = _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
         session.execute(
             text("""
                 INSERT INTO users (username, password_hash, display_name, role)
                 VALUES (:u, :pw, :dn, :r)
-                ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash
+                ON CONFLICT (username) DO UPDATE
+                    SET password_hash = EXCLUDED.password_hash,
+                        display_name = EXCLUDED.display_name,
+                        role = EXCLUDED.role
             """),
-            {"u": username, "pw": pw_hash, "dn": display_name, "r": role},
+            {"u": email, "pw": pw_hash, "dn": display_name, "r": role},
         )
     print(f"  Seeded {len(users)} users.")
 
@@ -178,9 +238,27 @@ def seed_test_claims(session: Session) -> None:
     print("  Seeded test claims.")
 
 
+def run_schema(engine) -> None:
+    """Create tables and views if they don't exist."""
+    schema_path = Path(__file__).resolve().parent / "schema.sql"
+    if not schema_path.exists():
+        print("  WARNING: schema.sql not found, skipping schema creation")
+        return
+    print("  Running schema.sql ...")
+    sql = schema_path.read_text()
+    with engine.connect() as conn:
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                conn.execute(text(stmt))
+        conn.commit()
+    print("  Schema ready.")
+
+
 def seed():
     """Run all seed operations."""
     engine = _build_engine()
+    run_schema(engine)
     with Session(engine) as session:
         print("Seeding database...")
         seed_users(session)

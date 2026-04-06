@@ -59,6 +59,14 @@ mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
 LOG_FILE="${LOG_DIR}/preflight_${TIMESTAMP}.log"
 
+# ── Colors ─────────────────────────────────────────────────────────
+C="\033[36m"       # cyan — banners
+O="\033[38;5;208m" # orange — section headers
+R="\033[31m"       # red — errors
+G="\033[32m"       # green — pass/success
+B="\033[1m"        # bold
+X="\033[0m"        # reset
+
 PASS=0
 FAIL=0
 HAS_ERRORS=false
@@ -68,10 +76,10 @@ check() {
   shift
   local output
   if output=$("$@" 2>&1); then
-    printf "  \033[32m✓\033[0m %s\n" "$name"
+    printf "  ${G}✓${X} %s\n" "$name"
     ((PASS++))
   else
-    printf "  \033[31m✗\033[0m %s\n" "$name"
+    printf "  ${R}✗${X} %s\n" "$name"
     echo "[${TIMESTAMP}] FAIL: ${name}" >> "$LOG_FILE"
     echo "  Command: $*" >> "$LOG_FILE"
     echo "  Output:  ${output}" >> "$LOG_FILE"
@@ -82,13 +90,13 @@ check() {
 }
 
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
-printf "\033[1m  PREFLIGHT — Claims Photo Fraud Detection\033[0m\n"
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  PREFLIGHT — Claims Photo Fraud Detection${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 
 # ── Auth & Config ──────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ GCP Auth\033[0m\n"
+printf "${O}${B}─ GCP Auth${X}\n"
 check "gcloud CLI installed" which gcloud
 check "gcloud authenticated" gcloud auth print-access-token
 check "Application Default Credentials" gcloud auth application-default print-access-token
@@ -98,7 +106,7 @@ PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "")
 
 # ── .env ───────────────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ Local .env\033[0m\n"
+printf "${O}${B}─ Local .env${X}\n"
 check ".env file exists" test -f "$ENV_FILE"
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -113,7 +121,7 @@ fi
 
 # ── Tools ──────────────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ Tools\033[0m\n"
+printf "${O}${B}─ Tools${X}\n"
 check "terraform" which terraform
 check "docker" which docker
 check "node" which node
@@ -122,33 +130,33 @@ check "Docker daemon" docker info
 
 # ── GCP Project ────────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ GCP Project\033[0m\n"
+printf "${O}${B}─ GCP Project${X}\n"
 check "Project accessible" gcloud projects describe "$PROJECT_ID"
 check "Billing enabled" bash -c "gcloud billing projects describe $PROJECT_ID 2>/dev/null | grep -q 'billingEnabled: true'"
 
 
 # ── Terraform ─────────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ Terraform\033[0m\n"
+printf "${O}${B}─ Terraform${X}\n"
 check "terraform validate" bash -c "cd ${PROJECT_ROOT}/terraform && terraform init -backend=false -input=false >/dev/null 2>&1 && terraform validate"
 
 # ── Git ────────────────────────────────────────────────────────────
 echo ""
-printf "\033[1m─ Safety\033[0m\n"
+printf "${O}${B}─ Safety${X}\n"
 check ".env gitignored" git check-ignore "$ENV_FILE"
 
 # ── Summary ────────────────────────────────────────────────────────
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
-printf "\033[1m  ${PASS} passed, ${FAIL} failed\033[0m\n"
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  ${PASS} passed, ${FAIL} failed${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 
 if [[ "$HAS_ERRORS" == true ]]; then
-  echo "Errors logged to: ${LOG_FILE}"
+  printf "${R}Errors logged to: ${LOG_FILE}${X}\n"
   exit 1
 fi
 
 # No errors — no log file needed
 rm -f "$LOG_FILE"
-printf "\033[32mAll clear.\033[0m\n"
+printf "${G}${B}All clear.${X}\n"
 exit 0

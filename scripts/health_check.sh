@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 ###############################################################################
 # health_check.sh — Post-deploy verification for Claims Photo Fraud Detection
@@ -26,12 +26,13 @@ set -euo pipefail
 #   2. Worker /health — Worker service responds
 #   3. Dashboard — serves HTML (nginx + React SPA)
 #   4. GCP APIs — all 10 required APIs enabled
-#   5. Cloud SQL instance — exists and reachable
-#   6. GCS bucket — photo storage bucket exists
-#   7. Pub/Sub subscription — worker push sub exists
-#   8. Pub/Sub topic — photo-uploads topic exists
-#   9. Artifact Registry — Docker image repo exists
-#  10. VPC connector — private network bridge exists
+#   5. Seed data — login as seed user, verify claims + prompts exist
+#   6. Cloud SQL instance — exists and reachable
+#   7. GCS bucket — photo storage bucket exists
+#   8. Pub/Sub subscription — worker push sub exists
+#   9. Pub/Sub topic — photo-uploads topic exists
+#  10. Artifact Registry — Docker image repo exists
+#  11. VPC connector — private network bridge exists
 #
 # OUTPUT:
 #   ✓ = pass, ✗ = fail. Exit 0 = all healthy, Exit 1 = failures found.
@@ -54,6 +55,14 @@ BUCKET="${GCS_BUCKET:-${PROJECT_ID}-claim-photos}"
 PUBSUB_SUB="worker-photo-sub"
 SQL_INSTANCE="fraud-detection-db"
 
+# ── Colors ─────────────────────────────────────────────────────────
+C="\033[36m"       # cyan — banners
+O="\033[38;5;208m" # orange — section headers
+R="\033[31m"       # red — errors
+G="\033[32m"       # green — success
+B="\033[1m"        # bold
+X="\033[0m"        # reset
+
 PASS=0
 FAIL=0
 ERRORS=()
@@ -61,18 +70,29 @@ ERRORS=()
 check() {
   local name="$1"
   shift
-  if "$@" >/dev/null 2>&1; then
-    echo "  ✓ ${name}"
-    ((PASS++))
-  else
-    echo "  ✗ ${name}"
+  local output
+  output=$("$@" 2>&1) && {
+    printf "  ${G}✓${X} %s\n" "$name"
+    ((PASS++)) || true
+  } || {
+    printf "  ${R}✗${X} %s\n" "$name"
+    if [[ -n "$output" ]]; then
+      echo "$output" | head -3 | sed 's/^/    /'
+    fi
     ERRORS+=("$name")
-    ((FAIL++))
-  fi
+    ((FAIL++)) || true
+  }
 }
 
+echo ""
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  HEALTH CHECK — Claims Photo Fraud Detection${X}\n"
+printf "${C}${B}  Project: ${PROJECT_ID}${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+
 # ── Resolve Cloud Run URLs ──────────────────────────────────────────
-echo "=== Resolving service URLs ==="
+echo ""
+printf "${O}${B}─ Resolving Service URLs${X}\n"
 
 API_URL="${API_URL:-$(gcloud run services describe claims-api --region="${REGION}" --format='value(status.url)' 2>/dev/null || echo "")}"
 WORKER_URL="${WORKER_URL:-$(gcloud run services describe claims-worker --region="${REGION}" --format='value(status.url)' 2>/dev/null || echo "")}"
@@ -83,15 +103,15 @@ ID_TOKEN=$(gcloud auth print-identity-token 2>/dev/null || echo "")
 
 # ── 1. API /health ──────────────────────────────────────────────────
 echo ""
-echo "=== Service Health ==="
+printf "${O}${B}─ Service Health${X}\n"
 
 if [[ -n "$API_URL" ]]; then
   check "API /api/health" \
     curl -sf -m 10 -H "Authorization: Bearer ${ID_TOKEN}" "${API_URL}/api/health"
 else
-  echo "  ✗ API /api/health (service not deployed)"
+  printf "  ${R}✗${X} API /api/health (service not deployed)\n"
   ERRORS+=("API /api/health")
-  ((FAIL++))
+  ((FAIL++)) || true
 fi
 
 # ── 2. Worker /health ───────────────────────────────────────────────
@@ -99,9 +119,9 @@ if [[ -n "$WORKER_URL" ]]; then
   check "Worker /health" \
     curl -sf -m 10 -H "Authorization: Bearer ${ID_TOKEN}" "${WORKER_URL}/health"
 else
-  echo "  ✗ Worker /health (service not deployed)"
+  printf "  ${R}✗${X} Worker /health (service not deployed)\n"
   ERRORS+=("Worker /health")
-  ((FAIL++))
+  ((FAIL++)) || true
 fi
 
 # ── 3. Dashboard serves HTML ────────────────────────────────────────
@@ -109,14 +129,14 @@ if [[ -n "$DASHBOARD_URL" ]]; then
   check "Dashboard serves HTML" \
     bash -c "curl -sf -m 10 '${DASHBOARD_URL}/' | grep -qi '</html>'"
 else
-  echo "  ✗ Dashboard serves HTML (service not deployed)"
+  printf "  ${R}✗${X} Dashboard serves HTML (service not deployed)\n"
   ERRORS+=("Dashboard serves HTML")
-  ((FAIL++))
+  ((FAIL++)) || true
 fi
 
 # ── 4. GCP APIs ─────────────────────────────────────────────────────
 echo ""
-echo "=== GCP APIs ==="
+printf "${O}${B}─ GCP APIs${X}\n"
 
 REQUIRED_APIS=(
   run.googleapis.com
@@ -135,9 +155,44 @@ for api in "${REQUIRED_APIS[@]}"; do
   check "${api}" bash -c "echo '${ENABLED_APIS}' | grep -q '${api}'"
 done
 
-# ── 5. Infrastructure ──────────────────────────────────────────────
+# ── 5. Seed Data Verification ─────────────────────────────────────
 echo ""
-echo "=== Infrastructure ==="
+printf "${O}${B}─ Seed Data${X}\n"
+
+if [[ -n "$API_URL" && -n "$ID_TOKEN" ]]; then
+  # Try to login as seed user — proves users table exists and was seeded
+  LOGIN_RESP=$(curl -sf -m 10 -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"username":"mchick@vtg-services.com","password":"gandalf!"}' \
+    "${API_URL}/api/auth/login" 2>/dev/null || echo "")
+  if echo "$LOGIN_RESP" | grep -q '"token"'; then
+    printf "  ${G}✓${X} Seed user login (mchick@vtg-services.com)\n"
+    ((PASS++))
+
+    # Use the token to check claims endpoint — proves claims table + test data
+    TOKEN=$(echo "$LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo "")
+    if [[ -n "$TOKEN" ]]; then
+      check "Claims endpoint returns data" \
+        bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${TOKEN}' '${API_URL}/api/claims' | grep -q 'claim_id'"
+
+      check "System prompts seeded" \
+        bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${TOKEN}' '${API_URL}/api/prompts' | grep -q 'fraud_system_instruction'"
+    fi
+  else
+    printf "  ${R}✗${X} Seed user login (mchick@vtg-services.com)\n"
+    ERRORS+=("Seed user login")
+    ((FAIL++))
+    echo "    Seed may not have run — try: ./deploy.sh --seed"
+  fi
+else
+  printf "  ${R}✗${X} Seed data (API not available)\n"
+  ERRORS+=("Seed data")
+  ((FAIL++)) || true
+fi
+
+# ── 6. Infrastructure ──────────────────────────────────────────────
+echo ""
+printf "${O}${B}─ Infrastructure${X}\n"
 
 check "Cloud SQL instance (${SQL_INSTANCE})" \
   gcloud sql instances describe "${SQL_INSTANCE}" --format='value(state)' --project="${PROJECT_ID}"
@@ -159,15 +214,17 @@ check "VPC connector" \
 
 # ── Summary ─────────────────────────────────────────────────────────
 echo ""
-echo "=== Results: ${PASS} passed, ${FAIL} failed ==="
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  ${PASS} passed, ${FAIL} failed${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 
 if [[ ${FAIL} -gt 0 ]]; then
-  echo "Failed checks:"
+  printf "${R}${B}Failed checks:${X}\n"
   for err in "${ERRORS[@]}"; do
-    echo "  - ${err}"
+    printf "  ${R}✗${X} %s\n" "$err"
   done
   exit 1
 fi
 
-echo "All checks passed."
+printf "${G}${B}All checks passed.${X}\n"
 exit 0

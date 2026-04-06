@@ -5,8 +5,8 @@ Handles password verification with bcrypt and JWT token creation/validation.
 
 from datetime import datetime, timedelta
 
+import bcrypt as _bcrypt
 from jose import jwt, JWTError
-from passlib.hash import bcrypt
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -25,7 +25,7 @@ def authenticate(db: Session, username: str, password: str) -> dict | None:
     if not row:
         return None
 
-    if not bcrypt.verify(password, row[2]):
+    if not _bcrypt.checkpw(password.encode(), row[2].encode()):
         return None
 
     token = jwt.encode(

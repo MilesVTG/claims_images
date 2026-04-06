@@ -55,6 +55,14 @@ ENV_FILE="${PROJECT_ROOT}/.env"
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 REGION="${GCP_REGION:-us-central1}"
 
+# ── Colors ─────────────────────────────────────────────────────────
+C="\033[36m"       # cyan — banners
+O="\033[38;5;208m" # orange — section headers
+R="\033[31m"       # red — errors
+G="\033[32m"       # green — success
+B="\033[1m"        # bold
+X="\033[0m"        # reset
+
 ERRORS=()
 
 # Load .env and export Terraform vars
@@ -65,12 +73,12 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
-printf "\033[1m  TEARDOWN — Claims Photo Fraud Detection\033[0m\n"
-printf "\033[1m  Project: ${PROJECT_ID}\033[0m\n"
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
+printf "${C}${B}  TEARDOWN — Claims Photo Fraud Detection${X}\n"
+printf "${C}${B}  Project: ${PROJECT_ID}${X}\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 echo ""
-printf "\033[31mThis will destroy ALL Claims Images infrastructure.\033[0m\n"
+printf "${R}${B}This will destroy ALL Claims Images infrastructure.${X}\n"
 echo "The GCP project itself will NOT be deleted."
 echo ""
 read -p "Are you sure? Type 'teardown' to confirm: " confirm
@@ -81,8 +89,8 @@ fi
 
 echo ""
 
-# ── 1. Cloud Run services ─────────────────────────────────────────
-printf "\033[1m─ Cloud Run Services\033[0m\n"
+# ── 1. Cloud Run services + jobs ──────────────────────────────────
+printf "${O}${B}─ Cloud Run Services${X}\n"
 for svc in claims-api claims-worker claims-dashboard; do
   echo "  Deleting ${svc} ..."
   gcloud run services delete "$svc" \
@@ -90,10 +98,15 @@ for svc in claims-api claims-worker claims-dashboard; do
     && echo "  Deleted ${svc}" \
     || echo "  ${svc} not found (skipped)"
 done
+# Cloud Run jobs
+gcloud run jobs delete claims-seed \
+  --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null \
+  && echo "  Deleted job: claims-seed" \
+  || echo "  claims-seed job not found (skipped)"
 
 # ── 2. Pub/Sub (pre-clean before Terraform) ───────────────────────
 echo ""
-printf "\033[1m─ Pub/Sub\033[0m\n"
+printf "${O}${B}─ Pub/Sub${X}\n"
 gcloud pubsub subscriptions delete worker-photo-sub \
   --project="$PROJECT_ID" --quiet 2>/dev/null \
   && echo "  Deleted subscription" \
@@ -105,7 +118,7 @@ gcloud pubsub topics delete photo-uploads \
 
 # ── 3. GCS notifications (pre-clean) ─────────────────────────────
 echo ""
-printf "\033[1m─ GCS Notifications\033[0m\n"
+printf "${O}${B}─ GCS Notifications${X}\n"
 NOTIF_IDS=$(gcloud storage buckets notifications list "gs://${PROJECT_ID}-claim-photos" \
   --format='value(etag)' --project="$PROJECT_ID" 2>/dev/null || echo "")
 if [[ -n "$NOTIF_IDS" ]]; then
@@ -120,7 +133,7 @@ fi
 
 # ── 4. Terraform destroy ──────────────────────────────────────────
 echo ""
-printf "\033[1m─ Terraform\033[0m\n"
+printf "${O}${B}─ Terraform${X}\n"
 if [[ -d "$TERRAFORM_DIR" ]]; then
   cd "$TERRAFORM_DIR"
 
@@ -147,18 +160,22 @@ if [[ -d "$TERRAFORM_DIR" ]]; then
         -auto-approve 2>/dev/null || true
     fi
 
-    # Pre-delete VPC peering — GCP holds it for minutes after Cloud SQL dies,
-    # which blocks terraform destroy. Force-remove it via gcloud first.
+    # Remove VPC peering from TF state — GCP holds it for 5+ minutes after
+    # Cloud SQL delete, blocking the entire destroy chain. We handle VPC
+    # cleanup via gcloud in fallback instead.
+    echo "  Removing VPC resources from Terraform state (cleaned up via gcloud fallback) ..."
+    terraform state rm google_service_networking_connection.private_vpc 2>/dev/null || true
+    terraform state rm google_compute_global_address.private_ip 2>/dev/null || true
+
+    # Pre-delete VPC peering via gcloud (may fail if still releasing — fallback will retry)
     if gcloud compute networks peerings list --network=claims-vpc \
         --project="$PROJECT_ID" --format='value(name)' 2>/dev/null | grep -q servicenetworking; then
-      echo "  Removing VPC peering (prevents terraform timeout) ..."
+      echo "  Deleting VPC peering via gcloud ..."
       gcloud compute networks peerings delete servicenetworking-googleapis-com \
-        --network=claims-vpc --project="$PROJECT_ID" --quiet 2>/dev/null
-      terraform state rm google_service_networking_connection.private_vpc 2>/dev/null || true
-      echo "  VPC peering removed"
+        --network=claims-vpc --project="$PROJECT_ID" --quiet 2>/dev/null || true
     fi
 
-    # Destroy — first attempt
+    # Destroy — first attempt (VPC resources already removed from state)
     echo "  Destroying infrastructure ..."
     if ! terraform destroy \
       -var="project_id=$PROJECT_ID" \
@@ -166,20 +183,16 @@ if [[ -d "$TERRAFORM_DIR" ]]; then
       -var="deletion_protection=false" \
       -auto-approve 2>&1; then
 
-      # Retry with increasing waits — VPC peering needs time after Cloud SQL delete
-      for wait in 30 60 90; do
-        echo ""
-        echo "  Destroy had errors. Waiting ${wait}s for GCP to release resources ..."
-        sleep "$wait"
-        echo "  Retrying ..."
-        if terraform destroy \
-          -var="project_id=$PROJECT_ID" \
-          -var="db_password=${DB_PASSWORD:-}" \
-          -var="deletion_protection=false" \
-          -auto-approve 2>&1; then
-          break
-        fi
-      done
+      # Single retry after 30s — most remaining resources just need a refresh
+      echo ""
+      echo "  Destroy had errors. Waiting 30s and retrying ..."
+      sleep 30
+      terraform destroy \
+        -var="project_id=$PROJECT_ID" \
+        -var="db_password=${DB_PASSWORD:-}" \
+        -var="deletion_protection=false" \
+        -auto-approve 2>&1 || true
+
       # Check if anything remains
       REMAINING=$(terraform state list 2>/dev/null | wc -l | tr -d ' ')
       if [[ "$REMAINING" -gt 0 ]]; then
@@ -195,7 +208,17 @@ fi
 
 # ── 5. Fallback cleanup (catches anything TF missed) ─────────────
 echo ""
-printf "\033[1m─ Fallback Cleanup\033[0m\n"
+printf "${O}${B}─ Fallback Cleanup${X}\n"
+
+# VPC resources (removed from TF state earlier, cleaned up here via gcloud)
+echo "  Cleaning up VPC resources ..."
+gcloud compute networks peerings delete servicenetworking-googleapis-com \
+  --network=claims-vpc --project="$PROJECT_ID" --quiet 2>/dev/null || true
+gcloud compute addresses delete claims-sql-ip \
+  --global --project="$PROJECT_ID" --quiet 2>/dev/null || true
+gcloud compute networks delete claims-vpc \
+  --project="$PROJECT_ID" --quiet 2>/dev/null || true
+echo "  VPC cleanup done (errors above are OK if already deleted)"
 
 # Artifact Registry
 gcloud artifacts repositories delete claims-images \
@@ -204,7 +227,7 @@ gcloud artifacts repositories delete claims-images \
   || echo "  Artifact Registry not found (skipped)"
 
 # Secrets
-for secret in gemini-api-key db-password session-secret exchange-password; do
+for secret in gemini-api-key db-password session-secret exchange-password seed-user-1-password seed-user-2-password; do
   gcloud secrets delete "$secret" \
     --project="$PROJECT_ID" --quiet 2>/dev/null \
     && echo "  Deleted secret: ${secret}" \
@@ -221,19 +244,19 @@ done
 
 # ── Summary ───────────────────────────────────────────────────────
 echo ""
-printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+printf "${C}${B}══════════════════════════════════════════════════${X}\n"
 if [[ ${#ERRORS[@]} -gt 0 ]]; then
-  printf "\033[1m\033[31m  Teardown completed with errors\033[0m\n"
-  printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+  printf "${R}${B}  Teardown completed with errors${X}\n"
+  printf "${C}${B}══════════════════════════════════════════════════${X}\n"
   for err in "${ERRORS[@]}"; do
-    printf "  \033[31m✗\033[0m %s\n" "$err"
+    printf "  ${R}✗${X} %s\n" "$err"
   done
   echo ""
   echo "Re-run: ./scripts/teardown.sh"
   exit 1
 else
-  printf "\033[1m  Teardown complete\033[0m\n"
-  printf "\033[1m══════════════════════════════════════════════════\033[0m\n"
+  printf "${G}${B}  Teardown complete${X}\n"
+  printf "${C}${B}══════════════════════════════════════════════════${X}\n"
   echo "GCP project ${PROJECT_ID} is intact. Infrastructure destroyed."
   echo "To rebuild: ./scripts/provision.sh && ./scripts/deploy.sh --all"
   exit 0

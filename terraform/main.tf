@@ -162,8 +162,29 @@ resource "google_secret_manager_secret" "session_secret" {
   }
 }
 
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "db-password"
+  replication {
+    auto {}
+  }
+}
+
 resource "google_secret_manager_secret" "exchange_password" {
   secret_id = "exchange-password"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "seed_user_1_password" {
+  secret_id = "seed-user-1-password"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "seed_user_2_password" {
+  secret_id = "seed-user-2-password"
   replication {
     auto {}
   }
