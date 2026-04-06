@@ -70,18 +70,20 @@ ERRORS=()
 check() {
   local name="$1"
   shift
-  local output
-  output=$("$@" 2>&1) && {
+  local output exit_code
+  output=$("$@" 2>&1) && exit_code=0 || exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
     printf "  ${G}✓${X} %s\n" "$name"
     ((PASS++)) || true
-  } || {
-    printf "  ${R}✗${X} %s\n" "$name"
+  else
+    printf "  ${R}✗${X} %s (exit code: %d)\n" "$name" "$exit_code"
     if [[ -n "$output" ]]; then
-      echo "$output" | head -3 | sed 's/^/    /'
+      # Strip HTML tags for readability, show first 5 lines
+      echo "$output" | sed 's/<[^>]*>//g' | sed '/^$/d' | head -5 | sed 's/^/    /'
     fi
     ERRORS+=("$name")
     ((FAIL++)) || true
-  }
+  fi
 }
 
 echo ""
@@ -127,7 +129,7 @@ fi
 # ── 3. Dashboard serves HTML ────────────────────────────────────────
 if [[ -n "$DASHBOARD_URL" ]]; then
   check "Dashboard serves HTML" \
-    bash -c "curl -sf -m 10 '${DASHBOARD_URL}/' | grep -qi '</html>'"
+    bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${ID_TOKEN}' '${DASHBOARD_URL}/' | grep -qi '</html>'"
 else
   printf "  ${R}✗${X} Dashboard serves HTML (service not deployed)\n"
   ERRORS+=("Dashboard serves HTML")
@@ -163,21 +165,19 @@ if [[ -n "$API_URL" && -n "$ID_TOKEN" ]]; then
   # Try to login as seed user — proves users table exists and was seeded
   LOGIN_RESP=$(curl -sf -m 10 -X POST \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${ID_TOKEN}" \
     -d '{"username":"mchick@vtg-services.com","password":"gandalf!"}' \
     "${API_URL}/api/auth/login" 2>/dev/null || echo "")
   if echo "$LOGIN_RESP" | grep -q '"token"'; then
     printf "  ${G}✓${X} Seed user login (mchick@vtg-services.com)\n"
     ((PASS++))
 
-    # Use the token to check claims endpoint — proves claims table + test data
-    TOKEN=$(echo "$LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo "")
-    if [[ -n "$TOKEN" ]]; then
-      check "Claims endpoint returns data" \
-        bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${TOKEN}' '${API_URL}/api/claims' | grep -q 'claim_id'"
+    # Use GCP identity token (not app JWT) for Cloud Run IAM auth on data endpoints
+    check "Claims endpoint returns data" \
+      bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${ID_TOKEN}' '${API_URL}/api/claims' | grep -q 'claim_id'"
 
-      check "System prompts seeded" \
-        bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${TOKEN}' '${API_URL}/api/prompts' | grep -q 'fraud_system_instruction'"
-    fi
+    check "System prompts seeded" \
+      bash -c "curl -sf -m 10 -H 'Authorization: Bearer ${ID_TOKEN}' '${API_URL}/api/prompts' | grep -q 'fraud_system_instruction'"
   else
     printf "  ${R}✗${X} Seed user login (mchick@vtg-services.com)\n"
     ERRORS+=("Seed user login")
