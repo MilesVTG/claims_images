@@ -339,3 +339,58 @@ def get_run_history(
         }
         for r in rows
     ]
+
+
+@router.get("/health/tests/{run_id}")
+def get_run_by_id(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return a specific test run with results grouped by category."""
+    from fastapi import HTTPException
+
+    run_row = db.execute(
+        text("SELECT * FROM test_runs WHERE id = :rid"),
+        {"rid": run_id},
+    ).fetchone()
+
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run_cols = run_row._mapping
+
+    results = db.execute(
+        text("SELECT * FROM test_results WHERE run_id = :rid ORDER BY category, test_name"),
+        {"rid": run_id},
+    ).fetchall()
+
+    by_category = {}
+    for r in results:
+        rm = r._mapping
+        cat = rm["category"] or "unknown"
+        if cat not in by_category:
+            by_category[cat] = []
+        by_category[cat].append({
+            "test_name": rm["test_name"],
+            "test_file": rm["test_file"],
+            "status": rm["status"],
+            "duration_ms": rm["duration_ms"],
+            "error_message": rm["error_message"],
+        })
+
+    return {
+        "run": {
+            "id": run_cols["id"],
+            "run_type": run_cols["run_type"],
+            "status": run_cols["status"],
+            "started_at": run_cols["started_at"],
+            "finished_at": run_cols["finished_at"],
+            "total": run_cols["total"],
+            "passed": run_cols["passed"],
+            "failed": run_cols["failed"],
+            "errors": run_cols["errors"],
+            "skipped": run_cols["skipped"],
+            "duration_ms": run_cols["duration_ms"],
+        },
+        "results_by_category": by_category,
+    }

@@ -28,15 +28,16 @@ const CATEGORY_ORDER = [
   'api_auth',
   'api_prompts',
   'api_health',
-  'golden_regression',
-  'pipeline_e2e',
 ];
 
 function formatCategory(cat) {
   return cat.replace(/_/g, ' ');
 }
 
-function TestRow({ label, status = 'pending', passed = 0, failed = 0, total = 0 }) {
+function TestRow({ label, status = 'pending', passed = 0, failed = 0, total = 0, tests }) {
+  const [expanded, setExpanded] = useState(false);
+  const expandable = tests && tests.length > 0;
+
   let statusText;
   let statusClass;
 
@@ -51,11 +52,53 @@ function TestRow({ label, status = 'pending', passed = 0, failed = 0, total = 0 
     statusClass = 'health-status--pending';
   }
 
+  const handleClick = () => {
+    if (expandable) setExpanded((prev) => !prev);
+  };
+
   return (
-    <div className="health-row">
-      <span className="health-row__label">&gt; {label}</span>
-      <span className="health-row__dots" />
-      <span className={`health-row__status ${statusClass}`}>{statusText}</span>
+    <div className={'health-row-group' + (expanded ? ' health-row-group--expanded' : '')}>
+      <div
+        className={'health-row' + (expandable ? ' health-row--expandable' : '')}
+        onClick={handleClick}
+      >
+        <span className="health-row__label">
+          {expandable && (
+            <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>▸</span>
+          )}
+          &gt; {label}
+        </span>
+        <span className="health-row__dots" />
+        <span className={`health-row__status ${statusClass}`}>{statusText}</span>
+      </div>
+      {expandable && (
+        <div className={'health-row__detail' + (expanded ? ' health-row__detail--open' : '')}>
+          <div className="health-row__detail-inner">
+            {tests.map((t, i) => {
+              const isPass = t.status === 'passed';
+              const isFail = t.status === 'failed' || t.status === 'error';
+              const isSkip = t.status === 'skipped';
+              let badgeClass = 'health-test-badge--pass';
+              let badgeLabel = 'pass';
+              if (isFail) { badgeClass = 'health-test-badge--fail'; badgeLabel = 'fail'; }
+              if (isSkip) { badgeClass = 'health-test-badge--skip'; badgeLabel = 'skip'; }
+              if (t.status === 'error') badgeLabel = 'error';
+
+              return (
+                <div key={t.test_name || i} className="health-test-item">
+                  <div className="health-test-item__row">
+                    <span className="health-test-item__name">{t.test_name}</span>
+                    <span className={`health-test-badge ${badgeClass}`}>{badgeLabel}</span>
+                  </div>
+                  {isFail && t.error_message && (
+                    <div className="health-test-item__error">{t.error_message}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -139,10 +182,12 @@ function UnitTab({ latestRun, resultsByCategory, running, onRun }) {
               passed={row.passed}
               failed={row.failed}
               total={row.total}
+              tests={resultsByCategory[row.cat]}
             />
           ))
         )}
       </div>
+      <PastRuns type="unit" currentRunId={latestRun?.id} />
     </div>
   );
 }
@@ -181,10 +226,12 @@ function IntegrationTab({ latestRun, resultsByCategory, running, onRun }) {
               passed={row.passed}
               failed={row.failed}
               total={row.total}
+              tests={resultsByCategory[row.cat]}
             />
           ))
         )}
       </div>
+      <PastRuns type="integration" currentRunId={latestRun?.id} />
     </div>
   );
 }
@@ -227,10 +274,96 @@ function PsychometricsTab({ latestRun, resultsByCategory, running, onRun }) {
               passed={row.passed}
               failed={row.failed}
               total={row.total}
+              tests={resultsByCategory[row.cat]}
             />
           ))
         )}
       </div>
+      <PastRuns type="psychometrics" currentRunId={latestRun?.id} />
+    </div>
+  );
+}
+
+function PastRunRow({ run }) {
+  const [expanded, setExpanded] = useState(false);
+  const [detail, setDetail] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const toggle = async () => {
+    if (!expanded && !detail) {
+      setLoading(true);
+      try {
+        const data = await api.get(`/health/tests/${run.id}`);
+        setDetail(data.results_by_category || {});
+      } catch {
+        setDetail({});
+      } finally {
+        setLoading(false);
+      }
+    }
+    setExpanded((v) => !v);
+  };
+
+  const summary = [];
+  if (run.passed) summary.push(`${run.passed} passed`);
+  if (run.failed) summary.push(`${run.failed} failed`);
+  if (run.errors) summary.push(`${run.errors} errors`);
+  if (!summary.length) summary.push(`${run.total} total`);
+
+  return (
+    <div className="past-run">
+      <div className="past-run__row" onClick={toggle}>
+        <span className="past-run__date">&gt; {formatTimestamp(run.started_at)}</span>
+        <span className="health-row__dots" />
+        <span className={`past-run__summary ${run.status === 'passed' ? 'health-status--pass' : 'health-status--fail'}`}>
+          [{summary.join(', ')}]
+        </span>
+        <span className="past-run__chevron">{expanded ? '[-]' : '[+]'}</span>
+      </div>
+      <div className={`past-run__detail ${expanded ? 'past-run__detail--open' : ''}`}>
+        {loading && <div className="past-run__loading">loading...</div>}
+        {detail && Object.keys(detail).map((cat) => {
+          const tests = detail[cat];
+          const passed = tests.filter((t) => t.status === 'passed').length;
+          const failed = tests.filter((t) => t.status === 'failed' || t.status === 'error').length;
+          const total = tests.length;
+          const rowStatus = failed > 0 ? 'fail' : 'pass';
+          return (
+            <TestRow
+              key={cat}
+              label={formatCategory(cat)}
+              status={rowStatus}
+              passed={passed}
+              failed={failed}
+              total={total}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PastRuns({ type, currentRunId }) {
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    api.get(`/health/tests/history?type=${type}`)
+      .then((data) => setHistory(data || []))
+      .catch(() => {});
+  }, [type, currentRunId]);
+
+  // Exclude the current run from past runs
+  const pastRuns = history.filter((r) => r.id !== currentRunId);
+
+  if (!pastRuns.length) return null;
+
+  return (
+    <div className="past-runs">
+      <div className="past-runs__header">// PAST TESTS</div>
+      {pastRuns.map((run) => (
+        <PastRunRow key={run.id} run={run} />
+      ))}
     </div>
   );
 }
