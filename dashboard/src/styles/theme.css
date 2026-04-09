@@ -275,6 +275,12 @@ body::after {
   color: var(--color-primary);
 }
 
+.page-desc {
+  color: var(--color-text-dim);
+  font-size: 0.8125rem;
+  margin: -0.5rem 0 1.25rem;
+}
+
 /* ── Login ── */
 .login-page {
   display: flex;
