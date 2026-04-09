@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 
 import pytest
@@ -46,6 +47,51 @@ _worker_exif = _load_module_from_path(
 _worker_risk = _load_module_from_path(
     "worker_risk", os.path.join(_worker_dir, "app", "services", "risk_service.py")
 )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline mock helper
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def mock_pipeline(wmain, exif_data=None, vision_data=None, gemini_result=None):
+    """Temporarily replace all external-service functions on the worker module.
+
+    Mocks: download_photo, extract_exif, reverse_image_lookup,
+    download_photos_for_claim, analyze_claim_with_gemini, send_high_risk_alert.
+    compute_risk_score is left real — it's pure logic.
+    """
+    _exif = exif_data if exif_data is not None else {}
+    _vision = vision_data if vision_data is not None else {}
+    _gemini = gemini_result if gemini_result is not None else {
+        "risk_score": 10, "red_flags": [],
+    }
+
+    originals = {}
+    names = [
+        "download_photo", "extract_exif", "reverse_image_lookup",
+        "download_photos_for_claim", "analyze_claim_with_gemini",
+        "send_high_risk_alert",
+    ]
+    for name in names:
+        originals[name] = getattr(wmain, name)
+
+    wmain.download_photo = lambda bucket_name, object_key: b"fake-image-bytes"
+    wmain.extract_exif = lambda image_bytes: _exif
+    wmain.reverse_image_lookup = lambda gs_uri: _vision
+    wmain.download_photos_for_claim = lambda bucket_name, cid, clid: [b"fake-image"]
+    wmain.analyze_claim_with_gemini = (
+        lambda db, contract_id, claim_id, claim_data, exif_data, vision_data, image_bytes_list: _gemini
+    )
+    wmain.send_high_risk_alert = (
+        lambda db, contract_id, claim_id, risk_score, red_flags: None
+    )
+
+    try:
+        yield
+    finally:
+        for name, orig in originals.items():
+            setattr(wmain, name, orig)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +136,19 @@ CREATE TABLE IF NOT EXISTS system_prompts (
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     updated_by TEXT
+);
+CREATE TABLE IF NOT EXISTS error_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now')),
+    service TEXT NOT NULL,
+    endpoint TEXT,
+    method TEXT,
+    status_code INTEGER,
+    error_type TEXT,
+    message TEXT,
+    traceback TEXT,
+    request_id TEXT,
+    pipeline_stage TEXT
 );
 """
 
@@ -180,37 +239,12 @@ class TestPipelineEndToEnd:
         """Clean claim flows through, gets low risk score, stored in DB."""
         client, wmain = worker_client
 
-        # Monkeypatch process_single_photo and run_claim_analysis
-        orig_psp = wmain.process_single_photo
-        orig_rca = wmain.run_claim_analysis
-
-        def mock_psp(db, bucket, object_key):
-            ids = _worker_exif.extract_ids_from_path(object_key)
-            db.execute(
-                text("INSERT OR IGNORE INTO processed_photos (storage_key, contract_id, claim_id, status) VALUES (:k, :c, :cl, 'completed')"),
-                {"k": object_key, "c": ids["contract_id"], "cl": ids["claim_id"]},
-            )
-            db.commit()
-            return {
-                "exif_data": {"DateTimeOriginal": "2026:03:15 10:00:00"},
-                "vision_data": {"full_matching_images": [], "partial_matching_images": []},
-                "ids": ids,
-            }
-
-        def mock_rca(db, bucket, contract_id, claim_id, exif_data, vision_data):
-            gemini = {"risk_score": 25, "red_flags": [], "geo_timestamp_check": {}}
-            result = _worker_risk.compute_risk_score(exif_data, vision_data, gemini)
-            db.execute(
-                text("INSERT OR REPLACE INTO claims (contract_id, claim_id, risk_score, red_flags) VALUES (:c, :cl, :s, :f)"),
-                {"c": contract_id, "cl": claim_id, "s": result["risk_score"], "f": json.dumps(result["red_flags"])},
-            )
-            db.commit()
-            return {"risk_score": result["risk_score"], "red_flags": result["red_flags"], "gemini_analysis": gemini}
-
-        wmain.process_single_photo = mock_psp
-        wmain.run_claim_analysis = mock_rca
-
-        try:
+        with mock_pipeline(
+            wmain,
+            exif_data={"DateTimeOriginal": "2026:03:15 10:00:00"},
+            vision_data={"full_matching_images": [], "partial_matching_images": []},
+            gemini_result={"risk_score": 25, "red_flags": [], "geo_timestamp_check": {}},
+        ):
             resp = client.post("/process", json={
                 "message": {"attributes": {
                     "bucketId": "claims-photos",
@@ -236,48 +270,18 @@ class TestPipelineEndToEnd:
                 {"c": "E2E_CTR", "cl": "CLM_E2E"},
             ).fetchone()
             assert claim is not None
-        finally:
-            wmain.process_single_photo = orig_psp
-            wmain.run_claim_analysis = orig_rca
 
     def test_idempotent_processing(self, worker_client, e2e_session):
         """Processing same photo twice: first processed, second skipped."""
         client, wmain = worker_client
 
-        orig_psp = wmain.process_single_photo
-        orig_rca = wmain.run_claim_analysis
-
-        def mock_psp(db, bucket, object_key):
-            ids = _worker_exif.extract_ids_from_path(object_key)
-            db.execute(
-                text("INSERT OR IGNORE INTO processed_photos (storage_key, contract_id, claim_id, status) VALUES (:k, :c, :cl, 'completed')"),
-                {"k": object_key, "c": ids["contract_id"], "cl": ids["claim_id"]},
-            )
-            db.commit()
-            return {"exif_data": {}, "vision_data": {}, "ids": ids}
-
-        def mock_rca(db, bucket, contract_id, claim_id, exif_data, vision_data):
-            result = _worker_risk.compute_risk_score({}, {}, {"risk_score": 10, "red_flags": []})
-            db.execute(
-                text("INSERT OR REPLACE INTO claims (contract_id, claim_id, risk_score, red_flags) VALUES (:c, :cl, :s, :f)"),
-                {"c": contract_id, "cl": claim_id, "s": result["risk_score"], "f": json.dumps(result["red_flags"])},
-            )
-            db.commit()
-            return {"risk_score": result["risk_score"], "red_flags": result["red_flags"], "gemini_analysis": {}}
-
-        wmain.process_single_photo = mock_psp
-        wmain.run_claim_analysis = mock_rca
-
-        try:
+        with mock_pipeline(wmain):
             msg = {"message": {"attributes": {"bucketId": "b", "objectId": "IDEMP/CLM_ID/photo.jpg"}}}
             resp1 = client.post("/process", json=msg)
             assert resp1.json()["status"] == "processed"
 
             resp2 = client.post("/process", json=msg)
             assert resp2.json()["status"] == "skipped"
-        finally:
-            wmain.process_single_photo = orig_psp
-            wmain.run_claim_analysis = orig_rca
 
     def test_ignores_non_image(self, worker_client):
         client, _ = worker_client
@@ -306,33 +310,17 @@ class TestPipelineFraudDetection:
     def test_fraud_claim_high_risk(self, worker_client, e2e_session):
         client, wmain = worker_client
 
-        orig_psp = wmain.process_single_photo
-        orig_rca = wmain.run_claim_analysis
-
-        def mock_psp(db, bucket, object_key):
-            ids = _worker_exif.extract_ids_from_path(object_key)
-            db.execute(
-                text("INSERT OR IGNORE INTO processed_photos (storage_key, contract_id, claim_id, status) VALUES (:k, :c, :cl, 'completed')"),
-                {"k": object_key, "c": ids["contract_id"], "cl": ids["claim_id"]},
-            )
-            db.commit()
-            return {"exif_data": {}, "vision_data": {"full_matching_images": ["url"]}, "ids": ids}
-
-        def mock_rca(db, bucket, contract_id, claim_id, exif_data, vision_data):
-            gemini = {"risk_score": 90, "red_flags": ["Stock photo", "Manipulated"], "geo_timestamp_check": {}, "reverse_image_flag": True}
-            vision = {"full_matching_images": ["url"], "partial_matching_images": []}
-            result = _worker_risk.compute_risk_score({}, vision, gemini)
-            db.execute(
-                text("INSERT OR REPLACE INTO claims (contract_id, claim_id, risk_score, red_flags) VALUES (:c, :cl, :s, :f)"),
-                {"c": contract_id, "cl": claim_id, "s": result["risk_score"], "f": json.dumps(result["red_flags"])},
-            )
-            db.commit()
-            return {"risk_score": result["risk_score"], "red_flags": result["red_flags"], "gemini_analysis": gemini}
-
-        wmain.process_single_photo = mock_psp
-        wmain.run_claim_analysis = mock_rca
-
-        try:
+        with mock_pipeline(
+            wmain,
+            exif_data={},
+            vision_data={"full_matching_images": ["url"], "partial_matching_images": []},
+            gemini_result={
+                "risk_score": 90,
+                "red_flags": ["Stock photo", "Manipulated"],
+                "geo_timestamp_check": {},
+                "reverse_image_flag": True,
+            },
+        ):
             resp = client.post("/process", json={
                 "message": {"attributes": {"bucketId": "b", "objectId": "FRAUD_E2E/CLM_FRD/sus.jpg"}}
             })
@@ -341,9 +329,6 @@ class TestPipelineFraudDetection:
             assert data["status"] == "processed"
             assert data["risk_score"] >= 50
             assert data["red_flags_count"] > 0
-        finally:
-            wmain.process_single_photo = orig_psp
-            wmain.run_claim_analysis = orig_rca
 
 
 class TestPipelineMessageParsing:
@@ -362,36 +347,9 @@ class TestPipelineMessageParsing:
     def test_supports_multiple_image_extensions(self, worker_client):
         client, wmain = worker_client
 
-        orig_psp = wmain.process_single_photo
-        orig_rca = wmain.run_claim_analysis
-
-        def mock_psp(db, bucket, object_key):
-            ids = _worker_exif.extract_ids_from_path(object_key)
-            db.execute(
-                text("INSERT OR IGNORE INTO processed_photos (storage_key, contract_id, claim_id, status) VALUES (:k, :c, :cl, 'completed')"),
-                {"k": object_key, "c": ids["contract_id"], "cl": ids["claim_id"]},
-            )
-            db.commit()
-            return {"exif_data": {}, "vision_data": {}, "ids": ids}
-
-        def mock_rca(db, bucket, contract_id, claim_id, exif_data, vision_data):
-            result = _worker_risk.compute_risk_score({}, {}, {"risk_score": 10, "red_flags": []})
-            db.execute(
-                text("INSERT OR REPLACE INTO claims (contract_id, claim_id, risk_score, red_flags) VALUES (:c, :cl, :s, :f)"),
-                {"c": contract_id, "cl": claim_id, "s": result["risk_score"], "f": json.dumps(result["red_flags"])},
-            )
-            db.commit()
-            return {"risk_score": result["risk_score"], "red_flags": result["red_flags"], "gemini_analysis": {}}
-
-        wmain.process_single_photo = mock_psp
-        wmain.run_claim_analysis = mock_rca
-
-        try:
+        with mock_pipeline(wmain):
             for ext in [".jpg", ".jpeg", ".png", ".webp"]:
                 resp = client.post("/process", json={
                     "message": {"attributes": {"bucketId": "b", "objectId": f"CTR_EXT/CLM_{ext}/photo{ext}"}}
                 })
                 assert resp.json()["status"] == "processed", f"Extension {ext} should be processed"
-        finally:
-            wmain.process_single_photo = orig_psp
-            wmain.run_claim_analysis = orig_rca

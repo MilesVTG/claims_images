@@ -222,36 +222,69 @@ async def handle_pubsub_push(request: Request, db: Session = Depends(get_db)):
 
     # --- Stage: db_upsert ---
     try:
-        db.execute(
-            text("""
-                INSERT INTO claims (
-                    contract_id, claim_id,
-                    extracted_metadata, reverse_image_results,
-                    gemini_analysis, risk_score, red_flags
-                ) VALUES (
-                    :cid, :clid,
-                    :meta::jsonb, :vision::jsonb,
-                    :gemini::jsonb, :score, :flags
-                )
-                ON CONFLICT (contract_id, claim_id)
-                DO UPDATE SET
-                    extracted_metadata = :meta::jsonb,
-                    reverse_image_results = :vision::jsonb,
-                    gemini_analysis = :gemini::jsonb,
-                    risk_score = :score,
-                    red_flags = :flags,
-                    processed_at = NOW()
-            """),
-            {
-                "cid": contract_id,
-                "clid": claim_id,
-                "meta": _to_json(exif_data),
-                "vision": _to_json(vision_data),
-                "gemini": _to_json(gemini_result),
-                "score": risk_result["risk_score"],
-                "flags": risk_result["red_flags"],
-            },
-        )
+        is_sqlite = db.bind.dialect.name == "sqlite"
+        if is_sqlite:
+            db.execute(
+                text("""
+                    INSERT INTO claims (
+                        contract_id, claim_id,
+                        extracted_metadata, reverse_image_results,
+                        gemini_analysis, risk_score, red_flags
+                    ) VALUES (
+                        :cid, :clid,
+                        :meta, :vision,
+                        :gemini, :score, :flags
+                    )
+                    ON CONFLICT (contract_id, claim_id)
+                    DO UPDATE SET
+                        extracted_metadata = :meta,
+                        reverse_image_results = :vision,
+                        gemini_analysis = :gemini,
+                        risk_score = :score,
+                        red_flags = :flags,
+                        processed_at = datetime('now')
+                """),
+                {
+                    "cid": contract_id,
+                    "clid": claim_id,
+                    "meta": _to_json(exif_data),
+                    "vision": _to_json(vision_data),
+                    "gemini": _to_json(gemini_result),
+                    "score": risk_result["risk_score"],
+                    "flags": _to_json(risk_result["red_flags"]),
+                },
+            )
+        else:
+            db.execute(
+                text("""
+                    INSERT INTO claims (
+                        contract_id, claim_id,
+                        extracted_metadata, reverse_image_results,
+                        gemini_analysis, risk_score, red_flags
+                    ) VALUES (
+                        :cid, :clid,
+                        :meta::jsonb, :vision::jsonb,
+                        :gemini::jsonb, :score, :flags
+                    )
+                    ON CONFLICT (contract_id, claim_id)
+                    DO UPDATE SET
+                        extracted_metadata = :meta::jsonb,
+                        reverse_image_results = :vision::jsonb,
+                        gemini_analysis = :gemini::jsonb,
+                        risk_score = :score,
+                        red_flags = :flags,
+                        processed_at = NOW()
+                """),
+                {
+                    "cid": contract_id,
+                    "clid": claim_id,
+                    "meta": _to_json(exif_data),
+                    "vision": _to_json(vision_data),
+                    "gemini": _to_json(gemini_result),
+                    "score": risk_result["risk_score"],
+                    "flags": risk_result["red_flags"],
+                },
+            )
         db.commit()
     except Exception as exc:
         log_pipeline_error("/process", exc, pipeline_stage="db_upsert")
