@@ -6,11 +6,11 @@ function Sidebar() {
       <ul>
         <li>
           <NavLink to="/" end>
-            Dashboard
+            dashboard
           </NavLink>
         </li>
         <li>
-          <NavLink to="/claims">Claims</NavLink>
+          <NavLink to="/claims">claims</NavLink>
         </li>
       </ul>
     </nav>

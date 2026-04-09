@@ -7,6 +7,17 @@ import StatusBadge from '../components/shared/StatusBadge';
 import RedFlagsList from '../components/shared/RedFlagsList';
 import PhotoGallery from '../components/shared/PhotoGallery';
 
+const SPINNER_FRAMES = ['|', '/', '-', '\\'];
+
+function TerminalSpinner() {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 120);
+    return () => clearInterval(id);
+  }, []);
+  return <span className="terminal-spinner">{SPINNER_FRAMES[frame]}</span>;
+}
+
 function ClaimDetailPage() {
   const { contractId, claimId } = useParams();
   const [claim, setClaim] = useState(null);
@@ -30,7 +41,7 @@ function ClaimDetailPage() {
     }
   }
 
-  if (loading) return <div className="page"><p className="loading-state">Loading claim details...</p></div>;
+  if (loading) return <div className="page"><p className="loading-state"><TerminalSpinner /> Loading claim details...</p></div>;
   if (error) return <div className="page"><p className="error-state">{error}</p></div>;
   if (!claim) return <div className="page"><p className="empty-state">Claim not found.</p></div>;
 
@@ -43,7 +54,7 @@ function ClaimDetailPage() {
   return (
     <div className="page claim-detail-page">
       <div className="claim-detail-header">
-        <Link to="/claims" className="back-link">← Back to Claims</Link>
+        <Link to="/claims" className="back-link">{'<-'} Back to Claims</Link>
         <h1>Claim {claimId}</h1>
         <StatusBadge status={claim.status} />
       </div>

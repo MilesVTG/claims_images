@@ -12,7 +12,7 @@ function Header() {
     <header className="app-header">
       <div className="header-brand">Claims Dashboard</div>
       <button className="header-logout" onClick={handleLogout}>
-        Sign Out
+        [sign out]
       </button>
     </header>
   );

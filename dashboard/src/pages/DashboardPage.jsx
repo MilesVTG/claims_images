@@ -4,6 +4,17 @@ import api from '../api/client';
 import RiskBadge from '../components/shared/RiskBadge';
 import StatusBadge from '../components/shared/StatusBadge';
 
+const SPINNER_FRAMES = ['|', '/', '-', '\\'];
+
+function TerminalSpinner() {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 120);
+    return () => clearInterval(id);
+  }, []);
+  return <span className="terminal-spinner">{SPINNER_FRAMES[frame]}</span>;
+}
+
 function DashboardPage() {
   const navigate = useNavigate();
   const [summary, setSummary] = useState(null);
@@ -31,7 +42,7 @@ function DashboardPage() {
     return (
       <div className="page dashboard-page">
         <h1>Dashboard</h1>
-        <p className="loading-state">Loading dashboard...</p>
+        <p className="loading-state"><TerminalSpinner /> Fetching dashboard data...</p>
       </div>
     );
   }
