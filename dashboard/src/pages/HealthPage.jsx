@@ -340,6 +340,7 @@ function PastRunRow({ run }) {
               passed={passed}
               failed={failed}
               total={total}
+              tests={tests}
             />
           );
         })}
