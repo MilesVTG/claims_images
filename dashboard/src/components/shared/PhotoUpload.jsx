@@ -106,43 +106,44 @@ function PhotoUpload({ contractId, claimId, onUploadComplete }) {
     <div className="photo-upload">
       <div className="photo-upload__header">// UPLOAD PHOTO</div>
 
-      {!isPreFilled && (
-        <div className="photo-upload__fields">
-          <label className="photo-upload__label">
-            contract_id:
-            <input
-              type="text"
-              value={contractInput}
-              onChange={(e) => setContractInput(e.target.value)}
-              disabled={status === 'uploading' || status === 'polling'}
-              className="photo-upload__input"
-              placeholder="e.g. CNT-001"
-            />
-          </label>
-          <label className="photo-upload__label">
-            claim_id:
-            <input
-              type="text"
-              value={claimInput}
-              onChange={(e) => setClaimInput(e.target.value)}
-              disabled={status === 'uploading' || status === 'polling'}
-              className="photo-upload__input"
-              placeholder="e.g. CLM-001"
-            />
-          </label>
+      <div className="photo-upload__fields">
+        {!isPreFilled && (
+          <>
+            <label className="photo-upload__label">
+              contract_id:
+              <input
+                type="text"
+                value={contractInput}
+                onChange={(e) => setContractInput(e.target.value)}
+                disabled={status === 'uploading' || status === 'polling'}
+                className="photo-upload__input"
+                placeholder="e.g. CNT-001"
+              />
+            </label>
+            <label className="photo-upload__label">
+              claim_id:
+              <input
+                type="text"
+                value={claimInput}
+                onChange={(e) => setClaimInput(e.target.value)}
+                disabled={status === 'uploading' || status === 'polling'}
+                className="photo-upload__input"
+                placeholder="e.g. CLM-001"
+              />
+            </label>
+          </>
+        )}
+        <div className="photo-upload__file-row">
+          <input
+            ref={fileRef}
+            type="file"
+            accept={ACCEPTED_TYPES}
+            onChange={handleFileChange}
+            disabled={status === 'uploading' || status === 'polling'}
+            className="photo-upload__file-input"
+          />
+          {file && <span className="photo-upload__filename">{file.name} ({(file.size / 1024).toFixed(0)} KB)</span>}
         </div>
-      )}
-
-      <div className="photo-upload__file-row">
-        <input
-          ref={fileRef}
-          type="file"
-          accept={ACCEPTED_TYPES}
-          onChange={handleFileChange}
-          disabled={status === 'uploading' || status === 'polling'}
-          className="photo-upload__file-input"
-        />
-        {file && <span className="photo-upload__filename">{file.name} ({(file.size / 1024).toFixed(0)} KB)</span>}
       </div>
 
       <div className="photo-upload__actions">
