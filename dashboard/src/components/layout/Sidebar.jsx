@@ -12,6 +12,9 @@ function Sidebar() {
         <li>
           <NavLink to="/claims">claims</NavLink>
         </li>
+        <li>
+          <NavLink to="/prompts">prompts</NavLink>
+        </li>
       </ul>
     </nav>
   );
