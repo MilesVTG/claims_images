@@ -317,6 +317,11 @@ body::after {
   color: var(--color-primary);
   text-shadow: 0 0 12px rgba(255, 140, 0, 0.4), 0 0 24px rgba(255, 140, 0, 0.15);
   margin-bottom: 0.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  position: relative;
 }
 
 .login-form h1.fraudi-title::before {
@@ -325,6 +330,79 @@ body::after {
 
 .login-form h1.fraudi-title::after {
   content: '';
+}
+
+/* ── Matrix text effect ── */
+.matrix-text {
+  display: inline-flex;
+}
+
+.matrix-char {
+  display: inline-block;
+  min-width: 0.65em;
+  text-align: center;
+}
+
+.matrix-char--scrambling {
+  color: var(--color-primary);
+  opacity: 0.6;
+}
+
+.matrix-char--revealed {
+  color: var(--color-primary);
+  opacity: 1;
+}
+
+/* ── ASCII star bursts ── */
+.ascii-stars {
+  position: relative;
+  display: inline-block;
+  width: 2.5rem;
+  height: 2rem;
+}
+
+.ascii-star {
+  color: var(--color-primary);
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(255, 140, 0, 0.5);
+}
+
+.fraudi-title__stars {
+  position: relative;
+  display: inline-block;
+  width: 3.5rem;
+  height: 3rem;
+  top: -0.15rem;
+}
+
+.fraudi-title__stars--right {
+  transform: scaleX(-1);
+}
+
+/* ── Header brand with effects ── */
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  position: relative;
+}
+
+.header-brand__stars {
+  position: relative;
+  display: inline-block;
+  width: 1.5rem;
+  height: 1.2rem;
+}
+
+.header-brand__stars--right {
+  transform: scaleX(-1);
+}
+
+.header-brand__text {
+  font-size: 1.125rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
 }
 
 .login-form label {
