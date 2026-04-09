@@ -19,6 +19,9 @@ function Sidebar({ open, onToggle }) {
           <li>
             <NavLink to="/prompts">prompts</NavLink>
           </li>
+          <li>
+            <NavLink to="/health">health</NavLink>
+          </li>
         </ul>
       )}
     </nav>

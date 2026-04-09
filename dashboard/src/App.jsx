@@ -6,6 +6,7 @@ import DashboardPage from './pages/DashboardPage';
 import ClaimsListPage from './pages/ClaimsListPage';
 import ClaimDetailPage from './pages/ClaimDetailPage';
 import PromptsPage from './pages/PromptsPage';
+import HealthPage from './pages/HealthPage';
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
         <Route path="/claims" element={<ClaimsListPage />} />
         <Route path="/claims/:contractId/:claimId" element={<ClaimDetailPage />} />
         <Route path="/prompts" element={<PromptsPage />} />
+        <Route path="/health" element={<HealthPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
