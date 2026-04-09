@@ -16,6 +16,11 @@ from app.dependencies import get_current_user
 router = APIRouter(prefix="/claims", tags=["claims"])
 
 
+def _is_sqlite(db: Session) -> bool:
+    """Return True if the session is backed by SQLite."""
+    return db.bind.dialect.name == "sqlite"
+
+
 @router.get("")
 def list_claims(
     page: int = Query(1, ge=1),
@@ -31,6 +36,7 @@ def list_claims(
     _user: dict = Depends(get_current_user),
 ):
     """Paginated claims list with filters and risk sorting."""
+    sqlite = _is_sqlite(db)
     conditions = []
     params: dict = {}
 
@@ -44,16 +50,29 @@ def list_claims(
         conditions.append("c.contract_id = :contract_id")
         params["contract_id"] = contract_id
     if tire_changed is True:
-        conditions.append("""
-            (c.gemini_analysis->'tire_brands_detected'->>'current') IS DISTINCT FROM
-            (c.gemini_analysis->'tire_brands_detected'->'previous'->>0)
-        """)
+        if sqlite:
+            conditions.append("""
+                json_extract(c.gemini_analysis, '$.tire_brands_detected.current')
+                IS NOT json_extract(c.gemini_analysis, '$.tire_brands_detected.previous[0]')
+            """)
+        else:
+            conditions.append("""
+                (c.gemini_analysis->'tire_brands_detected'->>'current') IS DISTINCT FROM
+                (c.gemini_analysis->'tire_brands_detected'->'previous'->>0)
+            """)
     if has_web_match is True:
-        conditions.append("""
-            jsonb_array_length(
-                COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
-            ) > 0
-        """)
+        if sqlite:
+            conditions.append("""
+                json_array_length(
+                    COALESCE(json_extract(c.reverse_image_results, '$.full_matching_images'), '[]')
+                ) > 0
+            """)
+        else:
+            conditions.append("""
+                jsonb_array_length(
+                    COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
+                ) > 0
+            """)
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -65,7 +84,13 @@ def list_claims(
     }
     order_col = sort_col_map[sort_by]
     order_dir = "DESC" if sort_dir == "desc" else "ASC"
-    nulls = "NULLS LAST" if sort_dir == "desc" else "NULLS FIRST"
+    # SQLite does not support NULLS LAST/FIRST; use a CASE expression instead
+    if sqlite:
+        nulls_prefix = f"CASE WHEN {order_col} IS NULL THEN 1 ELSE 0 END,"
+        nulls_suffix = ""
+    else:
+        nulls_prefix = ""
+        nulls_suffix = "NULLS LAST" if sort_dir == "desc" else "NULLS FIRST"
 
     # Count
     count_q = text(f"SELECT COUNT(*) FROM claims c {where}")
@@ -76,28 +101,54 @@ def list_claims(
     params["limit"] = per_page
     params["offset"] = offset
 
-    data_q = text(f"""
-        SELECT
-            c.id,
-            c.contract_id,
-            c.claim_id,
-            c.claim_date,
-            c.reported_loss_date,
-            c.service_drive_location,
-            c.risk_score,
-            c.red_flags,
-            c.gemini_analysis->>'recommendation' AS recommendation,
-            c.gemini_analysis->'tire_brands_detected'->>'current' AS current_tire_brand,
-            c.gemini_analysis->'vehicle_colors_detected'->>'current' AS current_vehicle_color,
-            jsonb_array_length(
-                COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
-            ) AS exact_web_matches,
-            c.processed_at
-        FROM claims c
-        {where}
-        ORDER BY {order_col} {order_dir} {nulls}
-        LIMIT :limit OFFSET :offset
-    """)
+    if sqlite:
+        # SQLite: use json_extract for JSON fields; these may be NULL if the
+        # JSON columns are empty, which is fine for display purposes.
+        data_q = text(f"""
+            SELECT
+                c.id,
+                c.contract_id,
+                c.claim_id,
+                c.claim_date,
+                c.reported_loss_date,
+                c.service_drive_location,
+                c.risk_score,
+                c.red_flags,
+                json_extract(c.gemini_analysis, '$.recommendation') AS recommendation,
+                json_extract(c.gemini_analysis, '$.tire_brands_detected.current') AS current_tire_brand,
+                json_extract(c.gemini_analysis, '$.vehicle_colors_detected.current') AS current_vehicle_color,
+                json_array_length(
+                    COALESCE(json_extract(c.reverse_image_results, '$.full_matching_images'), '[]')
+                ) AS exact_web_matches,
+                c.processed_at
+            FROM claims c
+            {where}
+            ORDER BY {nulls_prefix} {order_col} {order_dir}
+            LIMIT :limit OFFSET :offset
+        """)
+    else:
+        data_q = text(f"""
+            SELECT
+                c.id,
+                c.contract_id,
+                c.claim_id,
+                c.claim_date,
+                c.reported_loss_date,
+                c.service_drive_location,
+                c.risk_score,
+                c.red_flags,
+                c.gemini_analysis->>'recommendation' AS recommendation,
+                c.gemini_analysis->'tire_brands_detected'->>'current' AS current_tire_brand,
+                c.gemini_analysis->'vehicle_colors_detected'->>'current' AS current_vehicle_color,
+                jsonb_array_length(
+                    COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
+                ) AS exact_web_matches,
+                c.processed_at
+            FROM claims c
+            {where}
+            ORDER BY {nulls_prefix} {order_col} {order_dir} {nulls_suffix}
+            LIMIT :limit OFFSET :offset
+        """)
 
     rows = db.execute(data_q, params).fetchall()
 
