@@ -242,6 +242,31 @@ for sa in claims-api claims-worker; do
     || echo "  ${sa} SA not found (skipped)"
 done
 
+# Dashboard backend bucket (LB → GCS)
+gcloud compute backend-buckets delete dashboard-backend-bucket \
+  --project="$PROJECT_ID" --quiet 2>/dev/null \
+  && echo "  Deleted backend bucket: dashboard-backend-bucket" \
+  || echo "  dashboard-backend-bucket not found (skipped)"
+
+# Dashboard firewall rule
+gcloud compute firewall-rules delete allow-dashboard-http \
+  --project="$PROJECT_ID" --quiet 2>/dev/null \
+  && echo "  Deleted firewall rule: allow-dashboard-http" \
+  || echo "  allow-dashboard-http not found (skipped)"
+
+# Dashboard GCS bucket
+if gcloud storage buckets describe "gs://${PROJECT_ID}-dashboard" --project="$PROJECT_ID" &>/dev/null; then
+  echo "  Emptying dashboard bucket ..."
+  gcloud storage rm "gs://${PROJECT_ID}-dashboard/**" \
+    --project="$PROJECT_ID" --quiet 2>/dev/null || true
+  gcloud storage buckets delete "gs://${PROJECT_ID}-dashboard" \
+    --project="$PROJECT_ID" --quiet 2>/dev/null \
+    && echo "  Deleted bucket: ${PROJECT_ID}-dashboard" \
+    || echo "  Failed to delete dashboard bucket"
+else
+  echo "  Dashboard bucket not found (skipped)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────
 echo ""
 printf "${C}${B}══════════════════════════════════════════════════${X}\n"

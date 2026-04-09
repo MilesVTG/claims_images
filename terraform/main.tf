@@ -24,6 +24,7 @@ resource "google_project_service" "apis" {
     "vpcaccess.googleapis.com",
     "servicenetworking.googleapis.com",
     "cloudbuild.googleapis.com",
+    "compute.googleapis.com",
   ])
   service            = each.value
   disable_on_destroy = false
@@ -258,3 +259,65 @@ resource "google_vpc_access_connector" "connector" {
 # deploy.sh creates/updates the actual Cloud Run services because
 # they change frequently (new image on every deploy) and Terraform
 # would create state drift on every gcloud run deploy.
+
+# ── GCS (Dashboard static hosting) ───────────────────────────────────
+resource "google_storage_bucket" "dashboard" {
+  name                        = "${var.project_id}-dashboard"
+  location                    = "US"
+  uniform_bucket_level_access = true
+
+  website {
+    main_page_suffix = "index.html"
+    not_found_page   = "index.html"
+  }
+}
+
+resource "google_storage_bucket_iam_member" "dashboard_public" {
+  bucket = google_storage_bucket.dashboard.name
+  role   = "roles/storage.objectViewer"
+  member = "allUsers"
+}
+
+# ── External HTTP Load Balancer for Dashboard ────────────────────────
+# Serves the React SPA from GCS via a backend bucket with CDN enabled.
+
+resource "google_compute_backend_bucket" "dashboard_bucket" {
+  name        = "dashboard-backend-bucket"
+  bucket_name = google_storage_bucket.dashboard.name
+  enable_cdn  = true
+}
+
+resource "google_compute_url_map" "dashboard_url_map" {
+  name            = "dashboard-url-map"
+  default_service = google_compute_backend_bucket.dashboard_bucket.id
+}
+
+resource "google_compute_target_http_proxy" "dashboard_http_proxy" {
+  name    = "dashboard-http-proxy"
+  url_map = google_compute_url_map.dashboard_url_map.id
+}
+
+resource "google_compute_global_address" "dashboard_ip" {
+  name = "dashboard-lb-ip"
+}
+
+resource "google_compute_global_forwarding_rule" "dashboard_http" {
+  name                  = "dashboard-http-rule"
+  target                = google_compute_target_http_proxy.dashboard_http_proxy.id
+  port_range            = "80"
+  ip_address            = google_compute_global_address.dashboard_ip.id
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+}
+
+resource "google_compute_firewall" "dashboard_http" {
+  name    = "allow-dashboard-http"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["dashboard"]
+}

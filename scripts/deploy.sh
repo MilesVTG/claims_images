@@ -46,8 +46,8 @@ set -euo pipefail
 #   api:       Builds, deploys to claims-api (512Mi/1CPU, authenticated)
 #   worker:    Builds, deploys to claims-worker (1Gi/2CPU, authenticated),
 #              wires Pub/Sub push subscription to worker /process endpoint
-#   dashboard: Builds, deploys to claims-dashboard (256Mi/1CPU, domain-auth),
-#              injects API URL as env var, grants vtg-services.net access
+#   dashboard: Builds React app locally with VITE_API_URL baked in,
+#              uploads to GCS static bucket, invalidates CDN cache
 #   --seed:    Builds scripts/Dockerfile.seed, runs as a Cloud Run job
 #              inside the VPC (can reach private Cloud SQL). Seeds users,
 #              prompts, and test claims. Reads SEED_USER_N_* from .env.
@@ -56,7 +56,7 @@ set -euo pipefail
 #   - Cloud Build fails:     Check Dockerfile, check build logs in GCP Console
 #   - Deploy fails:          Check service account exists, check VPC connector
 #   - Pub/Sub wire fails:    Non-fatal — will wire on next deploy cycle
-#   - Dashboard can't reach API: Check API_SERVICE_URL env var on dashboard
+#   - Dashboard can't reach API: Rebuild with correct VITE_API_URL and re-upload
 #   - Seed job fails:        Check Cloud Run job logs in GCP Console
 #   - Permission denied:     Check IAM roles on service accounts
 #   - Image not found:       Artifact Registry repo may not exist — run provision.sh
@@ -66,6 +66,11 @@ set -euo pipefail
 #
 ###############################################################################
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Auth check (tokens, account, project) ─────────────────────────
+"${SCRIPT_DIR}/ensure_auth.sh"
+
 PROJECT_ID=$(gcloud config get-value project)
 REGION="${GCP_REGION:-us-central1}"
 REPO="${REGION}-docker.pkg.dev/${PROJECT_ID}/claims-images"
@@ -73,7 +78,6 @@ ALL_SERVICES=("api" "worker" "dashboard")
 TARGETS=()
 RUN_SEED=false
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}/.."
 
 usage() {
@@ -112,21 +116,30 @@ printf "${C}${B}═════════════════════�
 
 for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
   echo ""
-  printf "${O}${B}─ Building ${svc}${X}\n"
-  gcloud builds submit "${PROJECT_ROOT}/${svc}" --tag="${REPO}/${svc}:latest"
-
   printf "${O}${B}─ Deploying ${svc}${X}\n"
+
+  # Dashboard is served from GCS static hosting — no Docker image needed
+  if [[ "$svc" != "dashboard" ]]; then
+    printf "  Building Docker image ...\n"
+    gcloud builds submit "${PROJECT_ROOT}/${svc}" --tag="${REPO}/${svc}:latest"
+  fi
   case "$svc" in
     api)
+      # Get dashboard LB IP for CORS (may not exist on first deploy)
+      DASH_IP=$(gcloud compute addresses describe dashboard-lb-ip --global --format='value(address)' 2>/dev/null || echo "")
+      CORS="http://localhost:3000,http://localhost:5173,http://localhost:8080"
+      if [[ -n "$DASH_IP" ]]; then
+        CORS="http://${DASH_IP},${CORS}"
+      fi
       gcloud run deploy claims-api \
         --image="${REPO}/api:latest" \
         --region="${REGION}" \
         --memory=512Mi --cpu=1 \
-        --set-env-vars="GCS_BUCKET=${PROJECT_ID}-claim-photos,GEMINI_MODEL=gemini-2.5-flash,CLOUD_SQL_CONNECTION_NAME=${PROJECT_ID}:${REGION}:fraud-detection-db,DB_NAME=fraud_detection,DB_USER=fraud_user" \
+        --set-env-vars="^||^GCS_BUCKET=${PROJECT_ID}-claim-photos||GEMINI_MODEL=gemini-2.5-flash||CLOUD_SQL_CONNECTION_NAME=${PROJECT_ID}:${REGION}:fraud-detection-db||DB_NAME=fraud_detection||DB_USER=fraud_user||CORS_ORIGINS=${CORS}" \
         --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,DB_PASSWORD=db-password:latest,SESSION_SECRET=session-secret:latest" \
         --service-account="claims-api@${PROJECT_ID}.iam.gserviceaccount.com" \
         --vpc-connector=claims-vpc-connector \
-        --no-allow-unauthenticated
+        --allow-unauthenticated
       ;;
     worker)
       gcloud run deploy claims-worker \
@@ -147,25 +160,33 @@ for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
         || echo "  Note: Pub/Sub subscription will be wired on next provision + deploy cycle"
       ;;
     dashboard)
+      # 1. Get API URL
       API_URL=$(gcloud run services describe claims-api --region="${REGION}" --format='value(status.url)' 2>/dev/null || echo "")
       if [[ -z "$API_URL" ]]; then
-        printf "  ${R}WARNING: API not deployed yet — dashboard will not be able to reach it${X}\n"
+        printf "  ${R}WARNING: API not deployed yet — dashboard API calls will fail${X}\n"
         API_URL="https://claims-api-placeholder.run.app"
       fi
-      gcloud run deploy claims-dashboard \
-        --image="${REPO}/dashboard:latest" \
-        --region="${REGION}" \
-        --memory=256Mi --cpu=1 \
-        --set-env-vars="API_SERVICE_URL=${API_URL}" \
-        --no-allow-unauthenticated
 
-      # Grant domain access — org policy blocks allUsers
-      echo "  Granting dashboard access to vtg-services.net domain ..."
-      gcloud run services add-iam-policy-binding claims-dashboard \
-        --region="${REGION}" \
-        --member="domain:vtg-services.net" \
-        --role=roles/run.invoker \
-        --quiet
+      # 2. Build React app with VITE_API_URL baked in
+      echo "  Building dashboard (VITE_API_URL=${API_URL}/api) ..."
+      (cd "${PROJECT_ROOT}/dashboard" && VITE_API_URL="${API_URL}/api" npm run build)
+
+      # 3. Upload to GCS
+      DASH_BUCKET="${PROJECT_ID}-dashboard"
+      echo "  Uploading to gs://${DASH_BUCKET}/ ..."
+      gcloud storage cp -r "${PROJECT_ROOT}/dashboard/dist/*" "gs://${DASH_BUCKET}/"
+
+      # 4. Invalidate CDN
+      gcloud compute url-maps invalidate-cdn-cache dashboard-url-map --path="/*" --quiet || true
+
+      # 5. Print access info
+      DASH_IP=$(gcloud compute addresses describe dashboard-lb-ip --global --format='value(address)' 2>/dev/null || echo "")
+      echo ""
+      if [[ -n "$DASH_IP" ]]; then
+        printf "  ${G}Dashboard accessible at: http://${DASH_IP}${X}\n"
+      else
+        printf "  ${O}NOTE: LB IP not found — run provision.sh to create the load balancer${X}\n"
+      fi
       ;;
   esac
 done
