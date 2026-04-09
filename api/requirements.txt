@@ -13,3 +13,4 @@ python-dotenv
 python-jose[cryptography]
 bcrypt
 cloud-sql-python-connector[pg8000]
+httpx
