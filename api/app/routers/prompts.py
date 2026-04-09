@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 
 router = APIRouter(prefix="/prompts", tags=["prompts"])
 
@@ -39,6 +40,7 @@ def list_prompts(
     category: Optional[str] = None,
     active_only: bool = Query(True),
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
 ):
     """List all prompts, optionally filtered by category."""
     conditions = []
@@ -82,7 +84,7 @@ def list_prompts(
 
 
 @router.get("/{slug}")
-def get_prompt(slug: str, db: Session = Depends(get_db)):
+def get_prompt(slug: str, db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
     """Get a single prompt by slug."""
     row = db.execute(
         text("""
@@ -134,7 +136,7 @@ def get_prompt(slug: str, db: Session = Depends(get_db)):
 
 
 @router.post("", status_code=201)
-def create_prompt(body: PromptCreate, db: Session = Depends(get_db)):
+def create_prompt(body: PromptCreate, db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
     """Create a new prompt."""
     # Check for duplicate slug
     existing = db.execute(
@@ -171,7 +173,7 @@ def create_prompt(body: PromptCreate, db: Session = Depends(get_db)):
 
 
 @router.patch("/{slug}")
-def update_prompt(slug: str, body: PromptUpdate, db: Session = Depends(get_db)):
+def update_prompt(slug: str, body: PromptUpdate, db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
     """Update a prompt. Auto-increments version and logs to prompt_history."""
     # Fetch current prompt
     current = db.execute(

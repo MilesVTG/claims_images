@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import AppShell from './components/layout/AppShell';
+import RequireAuth from './components/auth/RequireAuth';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import ClaimsListPage from './pages/ClaimsListPage';
@@ -9,7 +10,7 @@ function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route element={<AppShell />}>
+      <Route element={<RequireAuth><AppShell /></RequireAuth>}>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/claims" element={<ClaimsListPage />} />
         <Route path="/claims/:contractId/:claimId" element={<ClaimDetailPage />} />

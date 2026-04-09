@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 
@@ -27,6 +28,7 @@ def list_claims(
     sort_by: str = Query("risk_score", pattern="^(risk_score|claim_date|processed_at)$"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
 ):
     """Paginated claims list with filters and risk sorting."""
     conditions = []
@@ -130,6 +132,7 @@ def list_claims(
 def get_claim_detail(
     claim_db_id: int,
     db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
 ):
     """Single claim detail with photos, full analysis, and red flags."""
     row = db.execute(

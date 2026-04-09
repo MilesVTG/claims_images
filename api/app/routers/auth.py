@@ -1,17 +1,17 @@
 """Auth endpoints (Section 14E / 18C).
 
 POST /auth/login  — authenticate and return JWT
-POST /auth/logout — client-side token discard (no server blacklist in POC)
+POST /auth/logout — blacklist JWT so it cannot be reused
 GET  /auth/me     — current user info from token
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from jose import JWTError
 
 from app.database import get_db
-from app.services.auth_service import authenticate, decode_token, get_current_user_from_db
+from app.dependencies import get_current_user, blacklist_token
+from app.services.auth_service import authenticate, get_current_user_from_db
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -19,19 +19,6 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 class LoginRequest(BaseModel):
     username: str
     password: str
-
-
-def get_current_user(
-    authorization: str = Header(..., description="Bearer <token>"),
-) -> dict:
-    """Dependency: extract and validate JWT from Authorization header."""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization.removeprefix("Bearer ").strip()
-    try:
-        return decode_token(token)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
 @router.post("/login")
@@ -45,8 +32,11 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/logout")
 def logout(user: dict = Depends(get_current_user)):
-    """Logout — in POC phase this is a no-op; client discards the token."""
-    return {"status": "ok", "message": "Token should be discarded by client"}
+    """Logout — blacklist the token's JTI so it cannot be reused."""
+    jti = user.get("jti")
+    if jti:
+        blacklist_token(jti)
+    return {"status": "ok", "message": "Token revoked"}
 
 
 @router.get("/me")

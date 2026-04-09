@@ -3,6 +3,7 @@
 Handles password verification with bcrypt and JWT token creation/validation.
 """
 
+import uuid
 from datetime import datetime, timedelta
 
 import bcrypt as _bcrypt
@@ -32,6 +33,7 @@ def authenticate(db: Session, username: str, password: str) -> dict | None:
         {
             "sub": row[1],
             "role": row[4],
+            "jti": str(uuid.uuid4()),
             "exp": datetime.utcnow() + timedelta(minutes=settings.session_timeout_minutes),
         },
         settings.session_secret,
@@ -53,7 +55,7 @@ def authenticate(db: Session, username: str, password: str) -> dict | None:
 def decode_token(token: str) -> dict:
     """Decode and validate a JWT token. Raises JWTError on failure."""
     payload = jwt.decode(token, settings.session_secret, algorithms=[ALGORITHM])
-    return {"username": payload["sub"], "role": payload["role"]}
+    return {"username": payload["sub"], "role": payload["role"], "jti": payload.get("jti")}
 
 
 def get_current_user_from_db(db: Session, username: str) -> dict | None:

@@ -8,12 +8,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/summary")
-def dashboard_summary(db: Session = Depends(get_db)):
+def dashboard_summary(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
     """Dashboard summary: totals, high-risk count, processing stats.
 
     Aggregates data across claims and processed_photos tables.

@@ -31,11 +31,7 @@ class Settings(BaseSettings):
     session_timeout_minutes: int = 60
 
     # -- CORS --
-    cors_origins: list[str] = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:8080",
-    ]
+    cors_origins: str = "http://localhost:3000,http://localhost:5173,http://localhost:8080"
 
     # -- App --
     debug: bool = False
