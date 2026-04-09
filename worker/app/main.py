@@ -224,6 +224,7 @@ def run_claim_analysis(
     # High-risk email alert
     try:
         send_high_risk_alert(
+            db=db,
             contract_id=contract_id,
             claim_id=claim_id,
             risk_score=risk_result["risk_score"],

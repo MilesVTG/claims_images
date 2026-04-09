@@ -146,26 +146,48 @@ def seed_prompts(session: Session) -> None:
             "Fraud Analysis - Main Template",
             "analysis",
             (
-                "Analyze these photos for fraud indicators.\n\n"
+                "Analyze these photos for fraud indicators.\n"
+                "\n"
                 "CONTRACT: {contract_id}\n"
-                "CLAIM: {claim_id}\n"
-                "CLAIM DATE: {claim_date}\n"
-                "REPORTED LOSS DATE: {reported_loss_date}\n\n"
-                "For each photo, examine:\n"
-                "1. Tire brands visible (compare across photos and prior claims)\n"
-                "2. Vehicle color consistency\n"
-                "3. Damage patterns and severity\n"
-                "4. Background/environment clues\n"
-                "5. EXIF metadata anomalies (timestamps, GPS, camera model)\n"
-                "6. Signs of image manipulation or stock photo usage\n\n"
-                "PRIOR CLAIMS FOR THIS CONTRACT:\n{prior_claims}\n\n"
-                "Respond with a JSON object containing:\n"
-                "- risk_score (0-100)\n"
-                "- red_flags (array of strings)\n"
-                "- tire_brands_detected (string)\n"
-                "- vehicle_colors_detected (string)\n"
-                "- damage_assessment (string)\n"
-                "- detailed_findings (string)"
+                "\n"
+                "PREVIOUS CLAIMS (last 24 months):\n"
+                "{history_text}\n"
+                "\n"
+                "CURRENT CLAIM:\n"
+                "  Claim ID: {claim_id}\n"
+                "  Reported Loss Date: {reported_loss_date}\n"
+                "  Service Drive Location: {service_drive_location}\n"
+                "  Service Drive Coordinates: {service_drive_coords}\n"
+                "  Photo EXIF Timestamp: {exif_timestamp}\n"
+                "  Photo GPS: {gps_lat}, {gps_lon}\n"
+                "  Reverse Image Hits: {full_matches} exact matches, {similar} similar\n"
+                "\n"
+                "REQUIRED ANALYSIS:\n"
+                "  1. Extract visible tire brand(s) from ALL photos (read logos/text).\n"
+                "  2. Extract vehicle color from ALL photos.\n"
+                "  3. Check for recycled/duplicate images.\n"
+                "  4. Assess damage authenticity (fresh vs. staged).\n"
+                "  5. Flag inconsistencies: tire brand change, color change, impossible damage timeline.\n"
+                "  6. Compare EXIF GPS to service drive coords -- flag if >5 miles apart.\n"
+                "  7. Compare EXIF timestamp to reported loss date -- flag if >48 hrs.\n"
+                "  8. Note any reverse image search hits as strong fraud indicators.\n"
+                "  9. Overall fraud risk score (0-100).\n"
+                "\n"
+                "RESPOND WITH ONLY VALID JSON:\n"
+                "{{\n"
+                '  "risk_score": <0-100>,\n'
+                '  "red_flags": ["flag1", "flag2"],\n'
+                '  "tire_brands_detected": {{"current": "...", "previous": ["..."]}},\n'
+                '  "vehicle_colors_detected": {{"current": "...", "previous": ["..."]}},\n'
+                '  "damage_assessment": "...",\n'
+                '  "geo_timestamp_check": {{\n'
+                '    "gps_vs_service_drive": "MATCH|MISMATCH (distance)",\n'
+                '    "timestamp_vs_loss_date": "MATCH|MISMATCH (details)"\n'
+                "  }},\n"
+                '  "reverse_image_flag": true|false,\n'
+                '  "explanation": "...",\n'
+                '  "recommendation": "..."\n'
+                "}}"
             ),
         ),
         (
@@ -188,9 +210,16 @@ def seed_prompts(session: Session) -> None:
             "High Risk Alert Email",
             "notification",
             (
-                "ALERT: Claim {claim_id} (Contract {contract_id}) scored {risk_score}/100.\n"
-                "Red flags: {red_flags}\n"
-                "Review at: {dashboard_url}"
+                "A claim has been flagged as HIGH RISK by the fraud detection system.\n"
+                "\n"
+                "Contract ID: {contract_id}\n"
+                "Claim ID:    {claim_id}\n"
+                "Risk Score:  {risk_score}\n"
+                "\n"
+                "Red Flags:\n"
+                "{flags_text}\n"
+                "\n"
+                "Review in dashboard: {dashboard_url}\n"
             ),
         ),
         (
@@ -202,6 +231,12 @@ def seed_prompts(session: Session) -> None:
                 "Process each photo in the batch and return a consolidated JSON response "
                 "with per-photo findings and an overall risk assessment."
             ),
+        ),
+        (
+            "high_risk_email_subject",
+            "High Risk Alert Email Subject",
+            "notification",
+            "HIGH RISK: Claim {claim_id} scored {risk_score}",
         ),
     ]
 

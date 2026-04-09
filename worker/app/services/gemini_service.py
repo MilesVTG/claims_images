@@ -14,23 +14,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.prompt_service import get_active_prompt
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Prompt helpers
-# ---------------------------------------------------------------------------
-
-def get_active_prompt(db: Session, slug: str) -> str:
-    """Fetch the active prompt content by slug from the database."""
-    result = db.execute(
-        text("SELECT content FROM system_prompts WHERE slug = :slug AND is_active = true"),
-        {"slug": slug},
-    ).fetchone()
-    if not result:
-        raise ValueError(f"No active prompt found for slug: {slug}")
-    return result[0]
 
 
 def get_contract_history(db: Session, contract_id: str, before_claim_id: str) -> list[dict]:
@@ -75,6 +61,7 @@ def get_contract_history(db: Session, contract_id: str, before_claim_id: str) ->
 # ---------------------------------------------------------------------------
 
 def build_analysis_prompt(
+    db: Session,
     contract_id: str,
     claim_id: str,
     claim_data: dict[str, Any],
@@ -82,7 +69,7 @@ def build_analysis_prompt(
     vision_data: dict[str, Any],
     history: list[dict],
 ) -> str:
-    """Build the per-claim analysis prompt from template data."""
+    """Build the per-claim analysis prompt from the DB template."""
     history_text = "None (first claim for this contract)"
     if history:
         lines = []
@@ -97,49 +84,21 @@ def build_analysis_prompt(
     full_matches = len(vision_data.get("full_matching_images", []))
     similar = len(vision_data.get("visually_similar_images", []))
 
-    prompt = f"""Analyze these photos for fraud indicators.
+    template = get_active_prompt(db, "fraud_analysis_template")
 
-CONTRACT: {contract_id}
-
-PREVIOUS CLAIMS (last 24 months):
-{history_text}
-
-CURRENT CLAIM:
-  Claim ID: {claim_id}
-  Reported Loss Date: {claim_data.get('reported_loss_date', 'N/A')}
-  Service Drive Location: {claim_data.get('service_drive_location', 'N/A')}
-  Service Drive Coordinates: {claim_data.get('service_drive_coords', 'N/A')}
-  Photo EXIF Timestamp: {exif_data.get('DateTimeOriginal', 'N/A')}
-  Photo GPS: {exif_data.get('gps_lat', 'N/A')}, {exif_data.get('gps_lon', 'N/A')}
-  Reverse Image Hits: {full_matches} exact matches, {similar} similar
-
-REQUIRED ANALYSIS:
-  1. Extract visible tire brand(s) from ALL photos (read logos/text).
-  2. Extract vehicle color from ALL photos.
-  3. Check for recycled/duplicate images.
-  4. Assess damage authenticity (fresh vs. staged).
-  5. Flag inconsistencies: tire brand change, color change, impossible damage timeline.
-  6. Compare EXIF GPS to service drive coords -- flag if >5 miles apart.
-  7. Compare EXIF timestamp to reported loss date -- flag if >48 hrs.
-  8. Note any reverse image search hits as strong fraud indicators.
-  9. Overall fraud risk score (0-100).
-
-RESPOND WITH ONLY VALID JSON:
-{{
-  "risk_score": <0-100>,
-  "red_flags": ["flag1", "flag2"],
-  "tire_brands_detected": {{"current": "...", "previous": ["..."]}},
-  "vehicle_colors_detected": {{"current": "...", "previous": ["..."]}},
-  "damage_assessment": "...",
-  "geo_timestamp_check": {{
-    "gps_vs_service_drive": "MATCH|MISMATCH (distance)",
-    "timestamp_vs_loss_date": "MATCH|MISMATCH (details)"
-  }},
-  "reverse_image_flag": true|false,
-  "explanation": "...",
-  "recommendation": "..."
-}}"""
-    return prompt
+    return template.format(
+        contract_id=contract_id,
+        claim_id=claim_id,
+        history_text=history_text,
+        reported_loss_date=claim_data.get("reported_loss_date", "N/A"),
+        service_drive_location=claim_data.get("service_drive_location", "N/A"),
+        service_drive_coords=claim_data.get("service_drive_coords", "N/A"),
+        exif_timestamp=exif_data.get("DateTimeOriginal", "N/A"),
+        gps_lat=exif_data.get("gps_lat", "N/A"),
+        gps_lon=exif_data.get("gps_lon", "N/A"),
+        full_matches=full_matches,
+        similar=similar,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +127,7 @@ def analyze_claim_with_gemini(
     history = get_contract_history(db, contract_id, claim_id)
 
     analysis_prompt = build_analysis_prompt(
-        contract_id, claim_id, claim_data, exif_data, vision_data, history
+        db, contract_id, claim_id, claim_data, exif_data, vision_data, history
     )
 
     model_instance = genai.GenerativeModel(

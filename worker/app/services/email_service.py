@@ -17,8 +17,10 @@ from exchangelib import (
     Message,
     DELEGATE,
 )
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.prompt_service import get_active_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ def send_alert_email(subject: str, body: str, to: list[str] | None = None):
 
 
 def send_high_risk_alert(
+    db: Session,
     contract_id: str,
     claim_id: str,
     risk_score: float,
@@ -91,22 +94,26 @@ def send_high_risk_alert(
     if risk_score < settings.high_risk_threshold:
         return
 
-    flags_text = "\n".join(f"  • {flag}" for flag in red_flags) if red_flags else "  (none)"
+    flags_text = "\n".join(f"  - {flag}" for flag in red_flags) if red_flags else "  (none)"
     dashboard_url = f"{settings.dashboard_base_url}/claims/{contract_id}/{claim_id}"
 
-    body = (
-        f"A claim has been flagged as HIGH RISK by the fraud detection system.\n\n"
-        f"Contract ID: {contract_id}\n"
-        f"Claim ID:    {claim_id}\n"
-        f"Risk Score:  {risk_score}\n\n"
-        f"Red Flags:\n{flags_text}\n\n"
-        f"Review in dashboard: {dashboard_url}\n"
+    body_template = get_active_prompt(db, "high_risk_email_template")
+    subject_template = get_active_prompt(db, "high_risk_email_subject")
+
+    body = body_template.format(
+        contract_id=contract_id,
+        claim_id=claim_id,
+        risk_score=risk_score,
+        flags_text=flags_text,
+        dashboard_url=dashboard_url,
     )
 
-    send_alert_email(
-        subject=f"HIGH RISK: Claim {claim_id} scored {risk_score}",
-        body=body,
+    subject = subject_template.format(
+        claim_id=claim_id,
+        risk_score=risk_score,
     )
+
+    send_alert_email(subject=subject, body=body)
     logger.info(
         "High-risk alert sent for %s/%s (score=%.1f)",
         contract_id, claim_id, risk_score,
