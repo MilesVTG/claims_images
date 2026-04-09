@@ -63,10 +63,12 @@ function TestRow({ label, status = 'pending', passed = 0, failed = 0, total = 0,
         onClick={handleClick}
       >
         <span className="health-row__label">
-          {expandable && (
+          {expandable ? (
             <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>▸</span>
+          ) : (
+            <span>&gt;</span>
           )}
-          &gt; {label}
+          {' '}{label}
         </span>
         <span className="health-row__dots" />
         <span className={`health-row__status ${statusClass}`}>{statusText}</span>
@@ -313,12 +315,14 @@ function PastRunRow({ run }) {
   return (
     <div className="past-run">
       <div className="past-run__row" onClick={toggle}>
-        <span className="past-run__date">&gt; {formatTimestamp(run.started_at)}</span>
+        <span className="past-run__date">
+          <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>▸</span>
+          {' '}{formatTimestamp(run.started_at)}
+        </span>
         <span className="health-row__dots" />
         <span className={`past-run__summary ${run.status === 'passed' ? 'health-status--pass' : 'health-status--fail'}`}>
           [{summary.join(', ')}]
         </span>
-        <span className="past-run__chevron">{expanded ? '[-]' : '[+]'}</span>
       </div>
       <div className={`past-run__detail ${expanded ? 'past-run__detail--open' : ''}`}>
         {loading && <div className="past-run__loading">loading...</div>}
