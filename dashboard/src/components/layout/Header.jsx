@@ -10,7 +10,7 @@ function Header() {
 
   return (
     <header className="app-header">
-      <div className="header-brand">Claims Dashboard</div>
+      <div className="header-brand">FRAUDI</div>
       <button className="header-logout" onClick={handleLogout}>
         [sign out]
       </button>

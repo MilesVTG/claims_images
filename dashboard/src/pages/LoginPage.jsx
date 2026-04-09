@@ -48,8 +48,8 @@ function LoginPage() {
   return (
     <div className="login-page">
       <form className="login-form" onSubmit={handleSubmit}>
-        <h1>Claims Dashboard</h1>
-        <p className="login-subtitle">Photo Fraud Detection System</p>
+        <h1 className="fraudi-title">FRAUDI</h1>
+        <p className="login-subtitle">Fraud Review &amp; Analysis of Uploaded Damage Images</p>
         {error && <p className="error">{error}</p>}
         {success && <p className="login-success">Authenticated</p>}
         <label>
