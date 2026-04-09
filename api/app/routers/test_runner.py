@@ -14,8 +14,10 @@ from app.database import get_db
 
 router = APIRouter(tags=["test_runner"])
 
-# Project root is 3 levels up from this file: routers/ -> app/ -> api/ -> project
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+# Project root: in Docker container it's /project, locally it's 3 levels up
+_container_root = "/project"
+_local_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+PROJECT_ROOT = _container_root if os.path.isdir(os.path.join(_container_root, "tests")) else _local_root
 
 # Category mapping: filename stem -> display category
 CATEGORY_MAP = {

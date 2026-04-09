@@ -119,9 +119,15 @@ for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
   printf "${O}${B}─ Deploying ${svc}${X}\n"
 
   # Dashboard is served from GCS static hosting — no Docker image needed
-  if [[ "$svc" != "dashboard" ]]; then
+  if [[ "$svc" == "api" ]]; then
+    # API image includes tests/ and worker/ for the test runner
+    printf "  Building Docker image (full project context) ...\n"
+    cd "${PROJECT_ROOT}" && \
+    gcloud builds submit . \
+      --tag="${REPO}/api:latest"
+  elif [[ "$svc" == "worker" ]]; then
     printf "  Building Docker image ...\n"
-    gcloud builds submit "${PROJECT_ROOT}/${svc}" --tag="${REPO}/${svc}:latest"
+    gcloud builds submit "${PROJECT_ROOT}/worker" --tag="${REPO}/worker:latest"
   fi
   case "$svc" in
     api)
