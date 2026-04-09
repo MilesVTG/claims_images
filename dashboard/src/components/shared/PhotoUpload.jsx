@@ -104,7 +104,7 @@ function PhotoUpload({ contractId, claimId, onUploadComplete }) {
 
   return (
     <div className="photo-upload">
-      <div className="photo-upload__header">&gt; upload_photo</div>
+      <div className="photo-upload__header">// UPLOAD PHOTO</div>
 
       {!isPreFilled && (
         <div className="photo-upload__fields">
