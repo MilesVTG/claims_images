@@ -114,6 +114,24 @@ CREATE TABLE IF NOT EXISTS test_results (
 );
 CREATE INDEX IF NOT EXISTS idx_test_results_run ON test_results (run_id);
 
+-- error_logs
+CREATE TABLE IF NOT EXISTS error_logs (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    service VARCHAR(20) NOT NULL,
+    endpoint VARCHAR(255),
+    method VARCHAR(10),
+    status_code INTEGER,
+    error_type VARCHAR(255),
+    message TEXT,
+    traceback TEXT,
+    request_id VARCHAR(100),
+    pipeline_stage VARCHAR(50)
+);
+CREATE INDEX IF NOT EXISTS idx_error_logs_timestamp ON error_logs (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_error_logs_service ON error_logs (service);
+CREATE INDEX IF NOT EXISTS idx_error_logs_request_id ON error_logs (request_id);
+
 -- Views
 CREATE OR REPLACE VIEW claims_dashboard_view AS
 SELECT
