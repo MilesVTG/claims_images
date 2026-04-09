@@ -1345,9 +1345,9 @@ body::after {
 
 .prompts-editor__save {
   padding: 0.5rem 1.25rem;
-  background: var(--color-primary);
-  color: #0a0a0a;
-  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border-bright);
   border-radius: var(--radius);
   font-family: var(--font-mono);
   font-size: 0.875rem;
@@ -1357,13 +1357,16 @@ body::after {
   transition: all 0.15s ease;
 }
 
-.prompts-editor__save:hover {
-  background: var(--color-primary-hover);
+.prompts-editor__save:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
   box-shadow: var(--glow-orange);
 }
 
 .prompts-editor__save:disabled {
-  opacity: 0.6;
+  color: var(--color-text-dim);
+  background: var(--color-surface-raised);
+  border-color: var(--color-border);
   cursor: not-allowed;
 }
 
@@ -1517,24 +1520,44 @@ body::after {
   margin-bottom: 1rem;
 }
 
+/*
+ * ── Button Style Conventions ──
+ *
+ * Action buttons use the "ghost bracket" pattern: [text]
+ *   - Default: grey text + grey border, transparent bg
+ *   - Hover: colored text + colored border + colored glow
+ *   - Disabled: grey bg (#1a1a1a), dim text, no pointer
+ *
+ * Color by intent:
+ *   - Destructive (logout, delete): red on hover
+ *   - Action (run, execute):        blue on hover
+ *   - Primary (save, submit):       orange on hover
+ *
+ * See: .header-logout, .health-run-btn, .prompts-editor__save
+ */
+
 .health-run-btn {
   font-family: var(--font-mono);
   font-size: 0.85rem;
-  color: var(--color-accent);
+  color: var(--color-text-muted);
   background: transparent;
-  border: 1px solid var(--color-accent);
+  border: 1px solid var(--color-border-bright);
+  border-radius: var(--radius);
   padding: 0.35rem 0.75rem;
   cursor: pointer;
   transition: all 0.2s ease;
 }
 
 .health-run-btn:hover:not(:disabled) {
-  background: rgba(255, 140, 0, 0.15);
-  text-shadow: var(--glow-amber);
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+  box-shadow: var(--glow-blue);
 }
 
 .health-run-btn:disabled {
-  opacity: 0.5;
+  color: var(--color-text-dim);
+  background: var(--color-surface-raised);
+  border-color: var(--color-border);
   cursor: wait;
 }
 
