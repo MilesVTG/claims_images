@@ -158,6 +158,13 @@ for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
         --vpc-connector=claims-vpc-connector \
         --no-allow-unauthenticated
 
+      # Grant Pub/Sub SA invoker role so push subscription can call /process
+      gcloud run services add-iam-policy-binding claims-worker \
+        --region="${REGION}" \
+        --member="serviceAccount:claims-worker@${PROJECT_ID}.iam.gserviceaccount.com" \
+        --role="roles/run.invoker" --quiet \
+        || echo "  Note: run.invoker binding may already exist"
+
       # Wire Pub/Sub push subscription to worker endpoint
       WORKER_URL=$(gcloud run services describe claims-worker --region="${REGION}" --format='value(status.url)')
       gcloud pubsub subscriptions update worker-photo-sub \
