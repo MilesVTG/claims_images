@@ -85,6 +85,35 @@ CREATE TABLE IF NOT EXISTS golden_dataset (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- test_runs
+CREATE TABLE IF NOT EXISTS test_runs (
+    id SERIAL PRIMARY KEY,
+    run_type VARCHAR(50) NOT NULL DEFAULT 'unit',
+    triggered_by VARCHAR(100),
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    status VARCHAR(20) DEFAULT 'running',
+    total INTEGER DEFAULT 0,
+    passed INTEGER DEFAULT 0,
+    failed INTEGER DEFAULT 0,
+    errors INTEGER DEFAULT 0,
+    skipped INTEGER DEFAULT 0,
+    duration_ms INTEGER
+);
+
+-- test_results
+CREATE TABLE IF NOT EXISTS test_results (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER REFERENCES test_runs(id) ON DELETE CASCADE,
+    test_name VARCHAR(500) NOT NULL,
+    test_file VARCHAR(255),
+    category VARCHAR(100),
+    status VARCHAR(20) NOT NULL,
+    duration_ms INTEGER,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_test_results_run ON test_results (run_id);
+
 -- Views
 CREATE OR REPLACE VIEW claims_dashboard_view AS
 SELECT

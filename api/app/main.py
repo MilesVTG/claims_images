@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import auth, claims, dashboard, health, photos, prompts
+from app.routers import auth, claims, dashboard, health, photos, prompts, test_runner
 
 app = FastAPI(
     title="Claims Photo Fraud Detection API",
@@ -31,3 +31,4 @@ app.include_router(claims.router, prefix="/api")
 app.include_router(photos.router, prefix="/api")
 app.include_router(prompts.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
+app.include_router(test_runner.router, prefix="/api")

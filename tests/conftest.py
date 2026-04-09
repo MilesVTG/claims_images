@@ -107,6 +107,33 @@ CREATE TABLE IF NOT EXISTS golden_dataset (
     notes TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS test_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_type TEXT NOT NULL DEFAULT 'unit',
+    triggered_by TEXT,
+    started_at TEXT DEFAULT (datetime('now')),
+    finished_at TEXT,
+    status TEXT DEFAULT 'running',
+    total INTEGER DEFAULT 0,
+    passed INTEGER DEFAULT 0,
+    failed INTEGER DEFAULT 0,
+    errors INTEGER DEFAULT 0,
+    skipped INTEGER DEFAULT 0,
+    duration_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS test_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER,
+    test_name TEXT NOT NULL,
+    test_file TEXT,
+    category TEXT,
+    status TEXT NOT NULL,
+    duration_ms INTEGER,
+    error_message TEXT,
+    FOREIGN KEY (run_id) REFERENCES test_runs(id) ON DELETE CASCADE
+);
 """
 
 
