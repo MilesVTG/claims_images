@@ -6,7 +6,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -14,10 +14,49 @@ from app.database import get_db
 
 router = APIRouter(tags=["test_runner"])
 
-# Project root: in Docker container it's /project, locally it's 3 levels up
-_container_root = "/project"
-_local_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-PROJECT_ROOT = _container_root if os.path.isdir(os.path.join(_container_root, "tests")) else _local_root
+
+# ---------------------------------------------------------------------------
+# Project root detection
+# ---------------------------------------------------------------------------
+
+def _find_project_root():
+    """Find project root by looking for pytest.ini."""
+    # Container path
+    if os.path.isfile("/project/pytest.ini"):
+        return "/project"
+    # Local dev: walk up from this file
+    d = os.path.abspath(os.path.dirname(__file__))
+    for _ in range(5):
+        d = os.path.dirname(d)
+        if os.path.isfile(os.path.join(d, "pytest.ini")):
+            return d
+    return os.getcwd()
+
+
+PROJECT_ROOT = _find_project_root()
+
+
+# ---------------------------------------------------------------------------
+# Test file mapping by type
+# ---------------------------------------------------------------------------
+
+TEST_FILES_BY_TYPE = {
+    "unit": [
+        "tests/test_api_health.py",
+        "tests/test_api_auth.py",
+        "tests/test_api_prompts.py",
+        "tests/test_api_claims.py",
+        "tests/test_api_dashboard.py",
+        "tests/test_api_config_deps.py",
+        "tests/test_worker_services.py",
+    ],
+    "integration": [
+        "tests/test_pipeline_e2e.py",
+    ],
+    "psychometrics": [
+        "tests/test_golden_regression.py",
+    ],
+}
 
 # Category mapping: filename stem -> display category
 CATEGORY_MAP = {
@@ -33,8 +72,6 @@ CATEGORY_MAP = {
 }
 
 # Regex to parse pytest -v output lines
-# Matches: tests/test_foo.py::TestClass::test_name PASSED
-# or:      tests/test_foo.py::test_name PASSED
 _RESULT_RE = re.compile(
     r"^(tests/\S+\.py)::(\S+)\s+(PASSED|FAILED|ERROR|SKIPPED)"
 )
@@ -62,28 +99,47 @@ def _parse_pytest_output(stdout: str) -> list[dict]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @router.post("/health/tests/run")
-def run_tests(db: Session = Depends(get_db)):
-    """Run the full pytest suite and store results in the DB."""
+def run_tests(
+    run_type: str = Query(default="unit", regex="^(unit|integration|psychometrics)$"),
+    db: Session = Depends(get_db),
+):
+    """Run pytest for a specific test type and store results in the DB."""
     started_at = datetime.now(timezone.utc)
     t0 = time.monotonic()
 
+    # Select test files for this run type
+    test_files = TEST_FILES_BY_TYPE.get(run_type, [])
+    if not test_files:
+        return {"run_id": None, "status": "error", "detail": f"Unknown run type: {run_type}"}
+
+    # Only include files that actually exist in the project
+    existing_files = [f for f in test_files if os.path.isfile(os.path.join(PROJECT_ROOT, f))]
+    if not existing_files:
+        return {"run_id": None, "status": "error", "detail": "No test files found in container"}
+
+    cmd = ["python3", "-m", "pytest"] + existing_files + ["-v", "--tb=line", "--no-header"]
+
     try:
         proc = subprocess.run(
-            ["python3", "-m", "pytest", "tests/", "-v", "--tb=line", "--no-header"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=120,
             cwd=PROJECT_ROOT,
         )
     except subprocess.TimeoutExpired:
-        # Record a failed run on timeout
         db.execute(
             text("""
                 INSERT INTO test_runs (run_type, triggered_by, started_at, finished_at, status, duration_ms)
-                VALUES ('unit', 'api', :started, :finished, 'error', :dur)
+                VALUES (:rtype, 'dashboard', :started, :finished, 'error', :dur)
             """),
             {
+                "rtype": run_type,
                 "started": started_at.isoformat(),
                 "finished": datetime.now(timezone.utc).isoformat(),
                 "dur": int((time.monotonic() - t0) * 1000),
@@ -106,6 +162,11 @@ def run_tests(db: Session = Depends(get_db)):
 
     run_status = "passed" if failed == 0 and errors == 0 else "failed"
 
+    # If 0 results, capture stderr for debugging
+    debug_info = None
+    if total == 0:
+        debug_info = (proc.stderr or "")[:2000] + "\n---STDOUT---\n" + (proc.stdout or "")[:2000]
+
     # Insert the run record
     row = db.execute(
         text("""
@@ -113,11 +174,12 @@ def run_tests(db: Session = Depends(get_db)):
                 (run_type, triggered_by, started_at, finished_at, status,
                  total, passed, failed, errors, skipped, duration_ms)
             VALUES
-                ('unit', 'api', :started, :finished, :status,
+                (:rtype, 'dashboard', :started, :finished, :status,
                  :total, :passed, :failed, :errors, :skipped, :dur)
             RETURNING id
         """),
         {
+            "rtype": run_type,
             "started": started_at.isoformat(),
             "finished": finished_at.isoformat(),
             "status": run_status,
@@ -134,13 +196,11 @@ def run_tests(db: Session = Depends(get_db)):
     # Parse error messages from the tb=line output for failed tests
     error_lines = {}
     if failed > 0 or errors > 0:
-        # --tb=line produces lines like: FAILED tests/test_foo.py::test_bar - AssertionError: ...
         for line in proc.stdout.splitlines():
             if line.startswith("FAILED "):
                 parts = line.split(" - ", 1)
                 if len(parts) == 2:
                     test_path = parts[0].replace("FAILED ", "").strip()
-                    # test_path looks like tests/test_foo.py::test_bar
                     name_part = test_path.split("::", 1)[-1] if "::" in test_path else test_path
                     error_lines[name_part] = parts[1].strip()
 
@@ -163,8 +223,9 @@ def run_tests(db: Session = Depends(get_db)):
 
     db.commit()
 
-    return {
+    response = {
         "run_id": run_id,
+        "run_type": run_type,
         "status": run_status,
         "total": total,
         "passed": passed,
@@ -173,14 +234,27 @@ def run_tests(db: Session = Depends(get_db)):
         "skipped": skipped,
         "duration_ms": elapsed_ms,
     }
+    if debug_info:
+        response["debug"] = debug_info
+
+    return response
 
 
 @router.get("/health/tests/latest")
-def get_latest_run(db: Session = Depends(get_db)):
+def get_latest_run(
+    run_type: str = Query(default=None, alias="type"),
+    db: Session = Depends(get_db),
+):
     """Return the most recent test run with results grouped by category."""
-    run_row = db.execute(
-        text("SELECT * FROM test_runs ORDER BY id DESC LIMIT 1")
-    ).fetchone()
+    if run_type:
+        run_row = db.execute(
+            text("SELECT * FROM test_runs WHERE run_type = :rtype ORDER BY id DESC LIMIT 1"),
+            {"rtype": run_type},
+        ).fetchone()
+    else:
+        run_row = db.execute(
+            text("SELECT * FROM test_runs ORDER BY id DESC LIMIT 1")
+        ).fetchone()
 
     if not run_row:
         return {"run": None, "results_by_category": {}}
@@ -193,7 +267,6 @@ def get_latest_run(db: Session = Depends(get_db)):
         {"rid": run_id},
     ).fetchall()
 
-    # Group by category
     by_category = {}
     for r in results:
         rm = r._mapping
@@ -227,17 +300,29 @@ def get_latest_run(db: Session = Depends(get_db)):
 
 
 @router.get("/health/tests/history")
-def get_run_history(db: Session = Depends(get_db)):
-    """Return the last 20 test runs (summary only, no individual results)."""
-    rows = db.execute(
-        text("""
-            SELECT id, run_type, status, started_at, total, passed, failed,
-                   errors, skipped, duration_ms
-            FROM test_runs
-            ORDER BY id DESC
-            LIMIT 20
-        """)
-    ).fetchall()
+def get_run_history(
+    run_type: str = Query(default=None, alias="type"),
+    db: Session = Depends(get_db),
+):
+    """Return the last 20 test runs (summary only)."""
+    if run_type:
+        rows = db.execute(
+            text("""
+                SELECT id, run_type, status, started_at, total, passed, failed,
+                       errors, skipped, duration_ms
+                FROM test_runs WHERE run_type = :rtype
+                ORDER BY id DESC LIMIT 20
+            """),
+            {"rtype": run_type},
+        ).fetchall()
+    else:
+        rows = db.execute(
+            text("""
+                SELECT id, run_type, status, started_at, total, passed, failed,
+                       errors, skipped, duration_ms
+                FROM test_runs ORDER BY id DESC LIMIT 20
+            """)
+        ).fetchall()
 
     return [
         {

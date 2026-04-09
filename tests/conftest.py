@@ -14,8 +14,9 @@ from typing import Generator
 
 # CRITICAL: Set env vars BEFORE importing any app modules.
 # database.py decides at import time whether to use Cloud SQL or direct URL.
-os.environ.setdefault("DATABASE_URL", "sqlite://")
-os.environ.setdefault("SESSION_SECRET", "test-secret-key")
+# Force override — tests ALWAYS use SQLite, never Cloud SQL (even in container)
+os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["SESSION_SECRET"] = "test-secret-key"
 
 import pytest
 from fastapi.testclient import TestClient
