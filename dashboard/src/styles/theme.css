@@ -16,6 +16,8 @@
   --color-text-dim: #666666;
   --color-border: #2a2a2a;
   --color-border-bright: #333333;
+  --color-disabled-bg: #222222;
+  --color-disabled-text: #444444;
   --sidebar-width: 220px;
   --sidebar-collapsed-width: 48px;
   --header-height: 56px;
@@ -505,8 +507,10 @@ body::after {
 }
 
 .login-form button:disabled {
-  opacity: 0.6;
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
   cursor: not-allowed;
+  opacity: 1;
 }
 
 /* ── Terminal Spinner ── */
@@ -1364,9 +1368,9 @@ body::after {
 }
 
 .prompts-editor__save:disabled {
-  color: var(--color-text-dim);
-  background: var(--color-surface-raised);
-  border-color: var(--color-border);
+  color: var(--color-disabled-text);
+  background: var(--color-disabled-bg);
+  border-color: var(--color-disabled-bg);
   cursor: not-allowed;
 }
 
@@ -1561,9 +1565,9 @@ body::after {
 }
 
 .health-run-btn:disabled {
-  color: var(--color-text-dim);
-  background: var(--color-surface-raised);
-  border-color: var(--color-border);
+  color: var(--color-disabled-text);
+  background: var(--color-disabled-bg);
+  border-color: var(--color-disabled-bg);
   cursor: wait;
 }
 
@@ -1878,9 +1882,9 @@ a:hover {
 }
 
 .photo-upload__btn:disabled {
-  color: var(--color-text-dim);
-  background: var(--color-surface-raised);
-  border-color: var(--color-border);
+  color: var(--color-disabled-text);
+  background: var(--color-disabled-bg);
+  border-color: var(--color-disabled-bg);
   cursor: not-allowed;
 }
 
