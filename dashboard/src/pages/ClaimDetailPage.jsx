@@ -6,6 +6,7 @@ import RiskBadge from '../components/shared/RiskBadge';
 import StatusBadge from '../components/shared/StatusBadge';
 import RedFlagsList from '../components/shared/RedFlagsList';
 import PhotoGallery from '../components/shared/PhotoGallery';
+import PhotoUpload from '../components/shared/PhotoUpload';
 
 const SPINNER_FRAMES = ['|', '/', '-', '\\'];
 
@@ -103,6 +104,12 @@ function ClaimDetailPage() {
       <div className="detail-card detail-card--full" style={{ marginBottom: '1.5rem' }}>
         <h2>Photos</h2>
         <PhotoGallery photos={photos} />
+      </div>
+
+      {/* Photo Upload */}
+      <div className="detail-card detail-card--full" style={{ marginBottom: '1.5rem' }}>
+        <h2>Upload Photo</h2>
+        <PhotoUpload contractId={contractId} claimId={claimId} onUploadComplete={fetchClaim} />
       </div>
 
       {/* Contract History */}

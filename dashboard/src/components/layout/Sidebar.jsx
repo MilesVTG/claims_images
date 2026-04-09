@@ -17,6 +17,9 @@ function Sidebar({ open, onToggle }) {
             <NavLink to="/claims">claims</NavLink>
           </li>
           <li>
+            <NavLink to="/upload">upload</NavLink>
+          </li>
+          <li>
             <NavLink to="/prompts">prompts</NavLink>
           </li>
           <li>

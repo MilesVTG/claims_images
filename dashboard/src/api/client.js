@@ -30,12 +30,41 @@ async function request(method, path, body = null) {
   return res.json();
 }
 
+async function upload(path, formData) {
+  const headers = {};
+
+  const token = sessionStorage.getItem('token');
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  if (res.status === 401) {
+    sessionStorage.removeItem('token');
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Upload failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
 const api = {
   get: (path) => request('GET', path),
   post: (path, body) => request('POST', path, body),
   put: (path, body) => request('PUT', path, body),
   delete: (path) => request('DELETE', path),
   patch: (path, body) => request('PATCH', path, body),
+  upload: (path, formData) => upload(path, formData),
 };
 
 export default api;

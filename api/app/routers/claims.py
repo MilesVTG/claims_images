@@ -21,6 +21,15 @@ def _is_sqlite(db: Session) -> bool:
     return db.bind.dialect.name == "sqlite"
 
 
+def _derive_status(processed_at, risk_score) -> str:
+    """Derive a display status from processed_at and risk_score."""
+    if not processed_at:
+        return "pending"
+    if risk_score is not None and risk_score > 50:
+        return "flagged"
+    return "processed"
+
+
 @router.get("")
 def list_claims(
     page: int = Query(1, ge=1),
@@ -120,7 +129,8 @@ def list_claims(
                 json_array_length(
                     COALESCE(json_extract(c.reverse_image_results, '$.full_matching_images'), '[]')
                 ) AS exact_web_matches,
-                c.processed_at
+                c.processed_at,
+                COALESCE(json_array_length(c.photo_uris), 0) AS photo_count
             FROM claims c
             {where}
             ORDER BY {nulls_prefix} {order_col} {order_dir}
@@ -143,7 +153,8 @@ def list_claims(
                 jsonb_array_length(
                     COALESCE(c.reverse_image_results->'full_matching_images', '[]'::jsonb)
                 ) AS exact_web_matches,
-                c.processed_at
+                c.processed_at,
+                COALESCE(array_length(c.photo_uris, 1), 0) AS photo_count
             FROM claims c
             {where}
             ORDER BY {nulls_prefix} {order_col} {order_dir} {nulls_suffix}
@@ -154,20 +165,25 @@ def list_claims(
 
     claims = []
     for row in rows:
+        claim_date_str = str(row[3]) if row[3] else None
+        processed_at_str = str(row[12]) if row[12] else None
         claims.append({
             "id": row[0],
             "contract_id": row[1],
             "claim_id": row[2],
-            "claim_date": str(row[3]) if row[3] else None,
+            "claim_date": claim_date_str,
+            "submission_date": claim_date_str,
             "reported_loss_date": str(row[4]) if row[4] else None,
             "service_drive_location": row[5],
             "risk_score": row[6],
+            "status": _derive_status(row[12], row[6]),
             "red_flags": row[7] or [],
             "recommendation": row[8],
             "current_tire_brand": row[9],
             "current_vehicle_color": row[10],
             "exact_web_matches": row[11],
-            "processed_at": str(row[12]) if row[12] else None,
+            "processed_at": processed_at_str,
+            "photo_count": row[13] or 0,
         })
 
     return {
@@ -179,40 +195,12 @@ def list_claims(
     }
 
 
-@router.get("/{claim_db_id}")
-def get_claim_detail(
-    claim_db_id: int,
-    db: Session = Depends(get_db),
-    _user: dict = Depends(get_current_user),
-):
-    """Single claim detail with photos, full analysis, and red flags."""
-    row = db.execute(
-        text("""
-            SELECT
-                c.id,
-                c.contract_id,
-                c.claim_id,
-                c.claim_date,
-                c.reported_loss_date,
-                c.service_drive_location,
-                c.service_drive_coords,
-                c.photo_uris,
-                c.extracted_metadata,
-                c.reverse_image_results,
-                c.gemini_analysis,
-                c.risk_score,
-                c.red_flags,
-                c.processed_at
-            FROM claims c
-            WHERE c.id = :id
-        """),
-        {"id": claim_db_id},
-    ).fetchone()
+def _build_claim_detail(row, db: Session):
+    """Shared detail builder used by both lookup-by-id and lookup-by-ids routes."""
+    claim_date_str = str(row[3]) if row[3] else None
+    photo_uris = row[7] or []
 
-    if not row:
-        raise HTTPException(status_code=404, detail="Claim not found")
-
-    # Also fetch processed photos for this claim
+    # Fetch processed photos for this claim
     photos = db.execute(
         text("""
             SELECT storage_key, status, processed_at
@@ -223,27 +211,30 @@ def get_claim_detail(
         {"cid": row[1], "clid": row[2]},
     ).fetchall()
 
-    # Also fetch contract history for context
+    # Fetch contract history for context
     history = db.execute(
         text("""
-            SELECT id, claim_id, claim_date, risk_score, red_flags
+            SELECT id, claim_id, claim_date, risk_score, red_flags, processed_at, photo_uris
             FROM claims
             WHERE contract_id = :cid AND id != :id
             ORDER BY claim_date DESC
             LIMIT 10
         """),
-        {"cid": row[1], "id": claim_db_id},
+        {"cid": row[1], "id": row[0]},
     ).fetchall()
 
     return {
         "id": row[0],
         "contract_id": row[1],
         "claim_id": row[2],
-        "claim_date": str(row[3]) if row[3] else None,
+        "claim_date": claim_date_str,
+        "submission_date": claim_date_str,
         "reported_loss_date": str(row[4]) if row[4] else None,
         "service_drive_location": row[5],
         "service_drive_coords": row[6],
-        "photo_uris": row[7] or [],
+        "photo_uris": photo_uris,
+        "photo_count": len(photo_uris),
+        "status": _derive_status(row[13], row[11]),
         "extracted_metadata": row[8],
         "reverse_image_results": row[9],
         "gemini_analysis": row[10],
@@ -255,6 +246,7 @@ def get_claim_detail(
                 "storage_key": p[0],
                 "status": p[1],
                 "processed_at": str(p[2]) if p[2] else None,
+                "url": f"/api/photos/serve/{p[0]}",
             }
             for p in photos
         ],
@@ -263,9 +255,69 @@ def get_claim_detail(
                 "id": h[0],
                 "claim_id": h[1],
                 "claim_date": str(h[2]) if h[2] else None,
+                "submission_date": str(h[2]) if h[2] else None,
                 "risk_score": h[3],
                 "red_flags": h[4] or [],
+                "status": _derive_status(h[5], h[3]),
+                "photo_count": len(h[6]) if h[6] else 0,
             }
             for h in history
         ],
     }
+
+
+_DETAIL_SQL = """
+    SELECT
+        c.id,
+        c.contract_id,
+        c.claim_id,
+        c.claim_date,
+        c.reported_loss_date,
+        c.service_drive_location,
+        c.service_drive_coords,
+        c.photo_uris,
+        c.extracted_metadata,
+        c.reverse_image_results,
+        c.gemini_analysis,
+        c.risk_score,
+        c.red_flags,
+        c.processed_at
+    FROM claims c
+"""
+
+
+@router.get("/{contract_id}/{claim_id}")
+def get_claim_by_ids(
+    contract_id: str,
+    claim_id: str,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """Claim detail looked up by contract_id + claim_id (used by dashboard)."""
+    row = db.execute(
+        text(_DETAIL_SQL + " WHERE c.contract_id = :cid AND c.claim_id = :clid"),
+        {"cid": contract_id, "clid": claim_id},
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    return _build_claim_detail(row, db)
+
+
+@router.get("/{claim_db_id}")
+def get_claim_detail(
+    claim_db_id: int,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """Single claim detail by database ID."""
+    row = db.execute(
+        text(_DETAIL_SQL + " WHERE c.id = :id"),
+        {"id": claim_db_id},
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    return _build_claim_detail(row, db)
