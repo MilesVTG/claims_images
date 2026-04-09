@@ -64,7 +64,7 @@ function TestRow({ label, status = 'pending', passed = 0, failed = 0, total = 0,
       >
         <span className="health-row__label">
           {expandable ? (
-            <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>▸</span>
+            <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>&gt;</span>
           ) : (
             <span>&gt;</span>
           )}
@@ -316,7 +316,7 @@ function PastRunRow({ run }) {
     <div className="past-run">
       <div className="past-run__row" onClick={toggle}>
         <span className="past-run__date">
-          <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>▸</span>
+          <span className={'health-row__caret' + (expanded ? ' health-row__caret--open' : '')}>&gt;</span>
           {' '}{formatTimestamp(run.started_at)}
         </span>
         <span className="health-row__dots" />
