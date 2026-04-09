@@ -20,7 +20,7 @@ describe('UploadPage', () => {
         <UploadPage />
       </MemoryRouter>
     );
-    expect(screen.getByText('> upload')).toBeInTheDocument();
+    expect(screen.getByText('Upload')).toBeInTheDocument();
   });
 
   it('renders description text', () => {

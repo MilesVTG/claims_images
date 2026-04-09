@@ -135,6 +135,20 @@ CREATE TABLE IF NOT EXISTS test_results (
     error_message TEXT,
     FOREIGN KEY (run_id) REFERENCES test_runs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS error_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now')),
+    service TEXT NOT NULL,
+    endpoint TEXT,
+    method TEXT,
+    status_code INTEGER,
+    error_type TEXT,
+    message TEXT,
+    traceback TEXT,
+    request_id TEXT,
+    pipeline_stage TEXT
+);
 """
 
 
@@ -388,4 +402,46 @@ def seed_test_photo(
     )
     session.commit()
     row = session.execute(text("SELECT id FROM processed_photos WHERE storage_key = :key"), {"key": storage_key}).fetchone()
+    return row[0]
+
+
+def seed_test_error_log(
+    session: Session,
+    service: str = "api",
+    endpoint: str = "/api/claims",
+    method: str = "GET",
+    status_code: int = 500,
+    error_type: str = "ValueError",
+    message: str = "test error",
+    traceback_str: str = "Traceback ...",
+    request_id: str = "req-001",
+    pipeline_stage: str | None = None,
+    timestamp: str | None = None,
+) -> int:
+    """Insert a test error log and return its ID."""
+    session.execute(
+        text("""
+            INSERT INTO error_logs
+                (service, endpoint, method, status_code, error_type,
+                 message, traceback, request_id, pipeline_stage, timestamp)
+            VALUES
+                (:svc, :ep, :method, :sc, :etype,
+                 :msg, :tb, :rid, :ps,
+                 COALESCE(:ts, datetime('now')))
+        """),
+        {
+            "svc": service,
+            "ep": endpoint,
+            "method": method,
+            "sc": status_code,
+            "etype": error_type,
+            "msg": message,
+            "tb": traceback_str,
+            "rid": request_id,
+            "ps": pipeline_stage,
+            "ts": timestamp,
+        },
+    )
+    session.commit()
+    row = session.execute(text("SELECT last_insert_rowid()")).fetchone()
     return row[0]

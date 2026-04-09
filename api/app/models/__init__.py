@@ -7,6 +7,7 @@ from app.models.processed_photo import ProcessedPhoto
 from app.models.system_prompt import SystemPrompt
 from app.models.prompt_history import PromptHistory
 from app.models.golden_dataset import GoldenDataset
+from app.models.error_log import ErrorLog
 
 __all__ = [
     "Base",
@@ -16,4 +17,5 @@ __all__ = [
     "SystemPrompt",
     "PromptHistory",
     "GoldenDataset",
+    "ErrorLog",
 ]

@@ -32,7 +32,7 @@ describe('PhotoUpload', () => {
 
   it('renders with terminal header', () => {
     render(<PhotoUpload />);
-    expect(screen.getByText('> upload_photo')).toBeInTheDocument();
+    expect(screen.getByText('// UPLOAD PHOTO')).toBeInTheDocument();
   });
 
   it('shows contract/claim ID inputs when not pre-filled', () => {

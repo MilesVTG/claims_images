@@ -5,6 +5,7 @@ const TABS = [
   { id: 'unit', label: 'UNIT' },
   { id: 'integration', label: 'INTEGRATION' },
   { id: 'psychometrics', label: 'PSYCHOMETRICS' },
+  { id: 'errors', label: 'ERRORS' },
 ];
 
 const RUN_LABELS = {
@@ -373,6 +374,92 @@ function PastRuns({ type, currentRunId }) {
   );
 }
 
+function ErrorsTab({ errors, loading, page, totalPages, onPageChange, onRefresh }) {
+  return (
+    <div className="health-tab-content">
+      <div className="health-section">
+        <div className="health-section__header health-section__header--with-btn">
+          <span>// error log</span>
+          <button
+            className="health-run-btn"
+            onClick={onRefresh}
+            disabled={loading}
+          >
+            {loading ? '[ loading... ]' : '[ refresh ]'}
+          </button>
+        </div>
+
+        {!loading && errors.length === 0 ? (
+          <div className="health-section__placeholder">[ -- no errors ]</div>
+        ) : (
+          <div className="errors-log">
+            {errors.map((err) => (
+              <ErrorEntry key={err.id} entry={err} />
+            ))}
+          </div>
+        )}
+
+        {totalPages > 1 && (
+          <div className="errors-pagination">
+            <button
+              className="errors-pagination__btn"
+              onClick={() => onPageChange(page - 1)}
+              disabled={page <= 1}
+            >
+              [&lt; prev]
+            </button>
+            <span className="errors-pagination__info">
+              page {page} / {totalPages}
+            </span>
+            <button
+              className="errors-pagination__btn"
+              onClick={() => onPageChange(page + 1)}
+              disabled={page >= totalPages}
+            >
+              [next &gt;]
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ErrorEntry({ entry }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const stageBadge = entry.pipeline_stage
+    ? <span className="errors-entry__badge errors-entry__badge--stage">{entry.pipeline_stage}</span>
+    : null;
+  const typeBadge = entry.error_type
+    ? <span className="errors-entry__badge errors-entry__badge--type">{entry.error_type}</span>
+    : null;
+
+  return (
+    <div className={'errors-entry' + (expanded ? ' errors-entry--expanded' : '')}>
+      <div className="errors-entry__row" onClick={() => setExpanded((v) => !v)}>
+        <span className="errors-entry__ts">{formatTimestamp(entry.timestamp)}</span>
+        <span className="errors-entry__service">{entry.service || '--'}</span>
+        <span className="errors-entry__endpoint">{entry.method ? `${entry.method} ` : ''}{entry.endpoint || '--'}</span>
+        {stageBadge}
+        {typeBadge}
+        {entry.status_code && <span className="errors-entry__status-code">{entry.status_code}</span>}
+      </div>
+      <div className={'errors-entry__message' + (expanded ? ' errors-entry__message--open' : '')}>
+        <div className="errors-entry__message-inner">
+          <div className="errors-entry__msg-text">{entry.message || 'No message'}</div>
+          {entry.traceback && (
+            <pre className="errors-entry__traceback">{entry.traceback}</pre>
+          )}
+          {entry.request_id && (
+            <div className="errors-entry__request-id">request_id: {entry.request_id}</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function HealthPage() {
   const [activeTab, setActiveTab] = useState('unit');
 
@@ -384,6 +471,26 @@ function HealthPage() {
   const [psychoRun, setPsychoRun] = useState(null);
   const [psychoResults, setPsychoResults] = useState({});
   const [running, setRunning] = useState(null); // which type is running
+
+  // Error log state
+  const [errorItems, setErrorItems] = useState([]);
+  const [errorPage, setErrorPage] = useState(1);
+  const [errorTotalPages, setErrorTotalPages] = useState(0);
+  const [errorLoading, setErrorLoading] = useState(false);
+
+  const fetchErrors = async (pg = 1) => {
+    setErrorLoading(true);
+    try {
+      const data = await api.get(`/errors?page=${pg}&per_page=50`);
+      setErrorItems(data.items || []);
+      setErrorPage(data.page || 1);
+      setErrorTotalPages(data.pages || 0);
+    } catch {
+      setErrorItems([]);
+    } finally {
+      setErrorLoading(false);
+    }
+  };
 
   const fetchLatest = async (type, setRun, setResults) => {
     try {
@@ -399,6 +506,7 @@ function HealthPage() {
     fetchLatest('unit', setUnitRun, setUnitResults);
     fetchLatest('integration', setIntRun, setIntResults);
     fetchLatest('psychometrics', setPsychoRun, setPsychoResults);
+    fetchErrors(1);
   }, []);
 
   const handleRun = async (type, setRun, setResults) => {
@@ -436,6 +544,16 @@ function HealthPage() {
         resultsByCategory={psychoResults}
         running={running === 'psychometrics'}
         onRun={() => handleRun('psychometrics', setPsychoRun, setPsychoResults)}
+      />
+    ),
+    errors: () => (
+      <ErrorsTab
+        errors={errorItems}
+        loading={errorLoading}
+        page={errorPage}
+        totalPages={errorTotalPages}
+        onPageChange={(pg) => fetchErrors(pg)}
+        onRefresh={() => fetchErrors(errorPage)}
       />
     ),
   };

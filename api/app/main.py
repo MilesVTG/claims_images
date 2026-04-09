@@ -4,7 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import auth, claims, dashboard, health, photos, prompts, test_runner
+from app.middleware.error_logging import register_error_handlers
+from app.routers import auth, claims, dashboard, errors, health, photos, prompts, test_runner
 
 app = FastAPI(
     title="Claims Photo Fraud Detection API",
@@ -23,6 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -- Error logging --
+register_error_handlers(app, service="api")
+
 # -- Routers --
 # Health is mounted at /api/health (no prefix on health router itself)
 app.include_router(health.router, prefix="/api")
@@ -30,5 +34,6 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(claims.router, prefix="/api")
 app.include_router(photos.router, prefix="/api")
 app.include_router(prompts.router, prefix="/api")
+app.include_router(errors.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(test_runner.router, prefix="/api")
