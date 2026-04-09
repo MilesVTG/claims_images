@@ -99,6 +99,73 @@ GCS notification on OBJECT_FINALIZE → Pub/Sub topic `photo-uploads`.
 ### Idempotency
 Worker checks `processed_photos` table before processing. Duplicate uploads are skipped.
 
+## System Prompt Management
+
+**Rule: ALL system prompts — current and future — MUST live in the `system_prompts` database table. No hardcoded prompts in code.** This is a compliance and auditability requirement. Every prompt change is versioned and tracked.
+
+### Database Tables
+
+**`system_prompts`** — Active prompts loaded at runtime:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| slug | VARCHAR (unique) | Lookup key used in code |
+| name | VARCHAR | Human-readable display name |
+| category | VARCHAR | One of: system_instruction, analysis, qa, notification |
+| content | TEXT | The prompt template (may contain `{placeholders}`) |
+| model | VARCHAR | Target model (e.g., `gemini-2.5-pro`) |
+| is_active | BOOLEAN | Only active prompts are loaded |
+| version | INTEGER | Auto-incremented on every update |
+| created_at | TIMESTAMP | Row creation time |
+| updated_at | TIMESTAMP | Last modification time |
+
+**`prompt_history`** — Automatic audit trail of all changes:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| prompt_id | FK → system_prompts | Which prompt changed |
+| version | INTEGER | Version number at time of change |
+| content | TEXT | Full prompt content at that version |
+| changed_by | VARCHAR | Who made the change (user or system) |
+| changed_at | TIMESTAMP | When the change occurred |
+
+### Current Prompt Inventory
+
+| Slug | Category | Used By | Purpose |
+|------|----------|---------|---------|
+| `fraud_system_instruction` | system_instruction | Gemini service | Sets investigator persona for fraud analysis |
+| `fraud_analysis_template` | analysis | Gemini service | Per-claim analysis template with dynamic data substitution |
+| `photo_qa_system` | system_instruction | Photo Q&A (future) | System instruction for photo question answering |
+| `photo_qa_template` | qa | Photo Q&A (future) | Template for user questions about photos |
+| `high_risk_email_template` | notification | Email service | High-risk alert email body template |
+| `high_risk_email_subject` | notification | Email service | High-risk alert email subject line template |
+| `batch_analysis_template` | analysis | Batch processing (future) | Template for batch photo analysis |
+
+### Categories
+
+| Category | Purpose |
+|----------|---------|
+| `system_instruction` | Model-level system instructions (persona, constraints) |
+| `analysis` | Templates for fraud analysis with dynamic data |
+| `qa` | Templates for question-answering features |
+| `notification` | Email subjects and bodies for alerts |
+
+### Adding a New Prompt
+
+1. Add to `scripts/seed.py` in the `seed_prompts()` function
+2. Or create via API: `POST /api/prompts` with slug, name, category, content
+3. Load in code: `get_active_prompt(db, "your_slug")`
+4. Use `.format(**data)` for dynamic substitution in templates
+
+### Updating a Prompt
+
+1. Via API: `PATCH /api/prompts/{slug}` — auto-increments version, logs previous content to `prompt_history`
+2. Via seed: update content in `seed.py`, re-run `./scripts/deploy.sh --seed`
+
+### Versioning
+
+Every update auto-increments the version number. The full history of every prompt is preserved in the `prompt_history` table with `changed_by` and `changed_at` fields. This provides a complete audit trail for compliance review — no prompt change is ever lost.
+
 ## Infrastructure (Terraform)
 
 All in `terraform/main.tf`:
